@@ -101,6 +101,3 @@ databases:
     plan: free
     databaseName: agentos
     user: agentos
-
-  - name: agentos-redis
-    plan: free
