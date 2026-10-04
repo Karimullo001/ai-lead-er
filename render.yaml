@@ -3,7 +3,7 @@ services:
     name: agentos-api
     runtime: python
     plan: free
-    buildCommand: python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
+    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
     startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
@@ -38,7 +38,7 @@ services:
     name: agentos-worker
     runtime: python
     plan: free
-    buildCommand: python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
+    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
     startCommand: python -m core.worker
     envVars:
       - key: DATABASE_URL
@@ -67,7 +67,7 @@ services:
     name: agentos-telegram
     runtime: python
     plan: free
-    buildCommand: python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
+    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
     startCommand: python -m telegram_bot.bot
     envVars:
       - key: DATABASE_URL
@@ -95,6 +95,13 @@ services:
         sync: false
       - key: XAI_API_KEY
         sync: false
+
+  - type: keyvalue
+    name: agentos-redis
+    plan: free
+    region: frankfurt
+    maxmemoryPolicy: allkeys_lru
+    ipAllowList: []
 
 databases:
   - name: agentos-db
