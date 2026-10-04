@@ -1,0 +1,1000 @@
+    async def check(self, text, context=None):
+        redacted = text
+        found: List[str] = []
+        for label, pat in self.PATTERNS.items():
+            if pat.search(redacted):
+                found.append(label)
+                redacted = pat.sub(f"[REDACTED_{label.upper()}]", redacted)
+        if found:
+            return GuardrailResult(passed=False,
+                                   reason=f"PII detected: {', '.join(found)}",
+                                   redacted_text=redacted)
+        return GuardrailResult(passed=True)
+
+
+class PromptInjectionGuardrail(Guardrail):
+    name = "prompt_injection"
+    PATTERNS = [
+        re.compile(r"ignore (all|previous) instructions", re.I),
+        re.compile(r"disregard (all|previous) (instructions|prompts)", re.I),
+        re.compile(r"you are now (a|an) ", re.I),
+        re.compile(r"reveal your (system prompt|instructions)", re.I),
+        re.compile(r"jailbreak", re.I),
+    ]
+
+    async def check(self, text, context=None):
+        for pat in self.PATTERNS:
+            if pat.search(text):
+                return GuardrailResult(passed=False,
+                                       reason=f"prompt injection signal: {pat.pattern}")
+        return GuardrailResult(passed=True)
+
+
+class LengthGuardrail(Guardrail):
+    name = "length"
+
+    def __init__(self, max_chars: int = 40000):
+        self.max_chars = max_chars
+
+    async def check(self, text, context=None):
+        if len(text) > self.max_chars:
+            return GuardrailResult(passed=False,
+                                   reason=f"input exceeds {self.max_chars} chars")
+        return GuardrailResult(passed=True)
+
+
+class GuardrailChain:
+    def __init__(self, guardrails: Optional[List[Guardrail]] = None):
+        self.guardrails = guardrails or [
+            LengthGuardrail(), PromptInjectionGuardrail(), PIIGuardrail()]
+
+    async def check(self, text: str, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
+        cur = text
+        for g in self.guardrails:
+            res = await g.check(cur, context)
+            if not res.passed:
+                return res
+            if res.redacted_text:
+                cur = res.redacted_text
+        return GuardrailResult(passed=True, redacted_text=cur)
+'''
+
+# ------------------------------------------------------------------ core/approval.py
+FILES["core/approval.py"] = r'''from __future__ import annotations
+import asyncio, time, uuid
+from typing import Any, Dict
+from pydantic import BaseModel, Field
+
+
+class ApprovalRequest(BaseModel):
+    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    task_id: str
+    agent_id: str
+    action: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    reason: str = ""
+    created_at: float = Field(default_factory=time.time)
+
+
+class ApprovalDecision(BaseModel):
+    request_id: str
+    approved: bool
+    decided_by: str = "system"
+    note: str = ""
+
+
+class ApprovalGate:
+    def __init__(self, auto_approve_in_dev: bool = False, timeout_seconds: int = 600):
+        self.pending: Dict[str, asyncio.Future] = {}
+        self.requests: Dict[str, ApprovalRequest] = {}
+        self.auto_approve_in_dev = auto_approve_in_dev
+        self.timeout_seconds = timeout_seconds
+
+    async def request(self, req: ApprovalRequest) -> ApprovalDecision:
+        if self.auto_approve_in_dev:
+            return ApprovalDecision(request_id=req.request_id, approved=True,
+                                    decided_by="auto_dev", note="auto-approved in dev mode")
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self.pending[req.request_id] = fut
+        self.requests[req.request_id] = req
+        try:
+            decision: ApprovalDecision = await asyncio.wait_for(fut, timeout=self.timeout_seconds)
+            return decision
+        except asyncio.TimeoutError:
+            return ApprovalDecision(request_id=req.request_id, approved=False,
+                                    decided_by="timeout", note="approval timed out")
+        finally:
+            self.pending.pop(req.request_id, None)
+            self.requests.pop(req.request_id, None)
+
+    def resolve(self, request_id: str, approved: bool,
+                decided_by: str = "user", note: str = "") -> bool:
+        fut = self.pending.get(request_id)
+        if not fut or fut.done():
+            return False
+        fut.set_result(ApprovalDecision(request_id=request_id, approved=approved,
+                                        decided_by=decided_by, note=note))
+        return True
+'''
+
+# ------------------------------------------------------------------ core/comm_bus.py
+FILES["core/comm_bus.py"] = r'''from __future__ import annotations
+import asyncio, logging, time, uuid
+from enum import Enum
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+log = logging.getLogger("agentos.comm")
+
+
+class MessageType(str, Enum):
+    HANDOFF = "handoff"
+    REQUEST = "request"
+    RESPONSE = "response"
+    NOTIFICATION = "notification"
+    BROADCAST = "broadcast"
+
+
+class AgentMessage(BaseModel):
+    message_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    type: MessageType
+    from_agent: str
+    to_agent: str
+    task_id: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    reply_to: Optional[str] = None
+    timestamp: float = Field(default_factory=time.time)
+
+
+class CommunicationBus:
+    def __init__(self):
+        self._inboxes: Dict[str, asyncio.Queue] = {}
+        self._handlers: Dict[str, Callable[[AgentMessage], Awaitable[None]]] = {}
+        self._pending: Dict[str, asyncio.Future] = {}
+
+    def register(self, agent_id: str, handler=None) -> None:
+        self._inboxes.setdefault(agent_id, asyncio.Queue())
+        if handler is not None:
+            self._handlers[agent_id] = handler
+
+    async def send(self, message: AgentMessage) -> None:
+        if message.to_agent not in self._inboxes:
+            raise KeyError(f"AgentNotFound: {message.to_agent}")
+        await self._inboxes[message.to_agent].put(message)
+
+    async def receive(self, agent_id: str) -> AgentMessage:
+        if agent_id not in self._inboxes:
+            self._inboxes[agent_id] = asyncio.Queue()
+        return await self._inboxes[agent_id].get()
+
+    async def request(self, message: AgentMessage, timeout: float = 300.0) -> AgentMessage:
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[message.message_id] = fut
+        await self.send(message)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending.pop(message.message_id, None)
+
+    async def reply(self, original: AgentMessage, from_agent: str,
+                    payload: Dict[str, Any]) -> None:
+        fut = self._pending.get(original.message_id)
+        if fut and not fut.done():
+            fut.set_result(AgentMessage(
+                type=MessageType.RESPONSE, from_agent=from_agent,
+                to_agent=original.from_agent, task_id=original.task_id,
+                payload=payload, reply_to=original.message_id))
+
+    async def broadcast(self, from_agent: str, payload: Dict[str, Any],
+                        exclude: Optional[List[str]] = None) -> None:
+        exclude = set(exclude or [])
+        for aid in list(self._inboxes.keys()):
+            if aid == from_agent or aid in exclude:
+                continue
+            await self.send(AgentMessage(type=MessageType.BROADCAST,
+                                         from_agent=from_agent, to_agent=aid,
+                                         payload=payload))
+'''
+
+# ------------------------------------------------------------------ core/kernel.py
+FILES["core/kernel.py"] = r'''from __future__ import annotations
+import asyncio, json, logging, time
+from typing import Any, Dict, List, Optional
+
+from .agent import AgentSpec, AgentState
+from .approval import ApprovalGate, ApprovalRequest
+from .comm_bus import CommunicationBus
+from .events import Event, EventStore
+from .guardrails import GuardrailChain
+from .llm import LLMClient
+from .memory import MemoryManager
+from .models import (Context, Plan, PlanStep, PlanStepAction, Reflection,
+                     StepResult, Task, TaskResult, Verification)
+from .prompts import (planning_prompt, reasoning_prompt, replanning_prompt,
+                      synthesis_prompt, tool_selection_prompt)
+from .reliability import ReliabilityEngine
+from .tools import Sandbox, ToolRegistry
+
+log = logging.getLogger("agentos.kernel")
+
+
+class MaxIterationsExceeded(Exception):
+    pass
+
+
+class AgentKernel:
+    def __init__(self, spec: AgentSpec, llm: LLMClient, tools: ToolRegistry,
+                 memory: MemoryManager, event_store: EventStore,
+                 reliability: ReliabilityEngine, comm_bus: CommunicationBus,
+                 approval_gate: Optional[ApprovalGate] = None,
+                 guardrails: Optional[GuardrailChain] = None,
+                 sandbox: Optional[Sandbox] = None,
+                 orchestrator_ref: Optional[Any] = None):
+        self.spec = spec
+        self.llm = llm
+        self.tools = tools
+        self.memory = memory
+        self.events = event_store
+        self.reliability = reliability
+        self.comm = comm_bus
+        self.approval = approval_gate or ApprovalGate(auto_approve_in_dev=True)
+        self.guardrails = guardrails or GuardrailChain()
+        self.sandbox = sandbox or Sandbox()
+        self.orchestrator = orchestrator_ref
+        self.state: AgentState = AgentState.IDLE
+        self._iteration = 0
+        self._current_plan: Optional[Plan] = None
+        self._step_outputs: List[str] = []
+        self.comm.register(self.spec.agent_id)
+
+    async def run(self, task: Task) -> TaskResult:
+        t0 = time.time()
+        stream_id = f"task:{task.id}"
+        await self._emit(stream_id, "kernel.started", {"agent": self.spec.agent_id})
+        self.state = AgentState.PLANNING
+        self._iteration = 0
+        self._step_outputs = []
+        try:
+            result = await asyncio.wait_for(self._pev_loop(task, stream_id),
+                                            timeout=self.spec.timeout_seconds)
+            await self._emit(stream_id, "kernel.completed",
+                             {"summary": result.summary[:500]})
+            self.state = AgentState.DONE
+            result.elapsed_seconds = time.time() - t0
+            return result
+        except asyncio.TimeoutError:
+            await self._emit(stream_id, "kernel.timeout",
+                             {"timeout": self.spec.timeout_seconds})
+            self.state = AgentState.FAILED
+            return TaskResult(task_id=task.id, summary="Timed out", success=False,
+                              error="timeout", elapsed_seconds=time.time() - t0)
+        except Exception as e:
+            log.exception("Kernel failed")
+            await self._emit(stream_id, "kernel.failed", {"error": str(e)})
+            self.state = AgentState.FAILED
+            return TaskResult(task_id=task.id, summary=f"Failed: {e}", success=False,
+                              error=str(e), elapsed_seconds=time.time() - t0)
+        finally:
+            await self.memory.flush(task.id)
+
+    async def _pev_loop(self, task: Task, stream_id: str) -> TaskResult:
+        context = await self.memory.build_context(
+            task, working_buffer=self.spec.memory_config["working_buffer_size"],
+            episodic_k=self.spec.memory_config["episodic_retrieval_k"])
+        g = await self.guardrails.check(task.description, {"phase": "input"})
+        if not g.passed:
+            return TaskResult(task_id=task.id, summary=f"Blocked by guardrail: {g.reason}",
+                              success=False, error=g.reason)
+        await self._emit(stream_id, "kernel.perceived", {"tokens": context.token_count})
+
+        plan = await self._plan(task, context)
+        self._current_plan = plan
+        await self._emit(stream_id, "kernel.planned",
+                         {"steps": [s.description for s in plan.steps]})
+
+        replans = 0
+        max_replans = 3
+        idx = 0
+        while idx < len(plan.steps):
+            step = plan.steps[idx]
+            self._iteration += 1
+            if self._iteration > self.spec.max_iterations:
+                raise MaxIterationsExceeded(self.spec.max_iterations)
+            if step.action == PlanStepAction.FINISH:
+                break
+
+            self.state = AgentState.EXECUTING
+            try:
+                step_result = await self._execute_step(step, task, context)
+            except Exception as e:
+                if replans >= max_replans:
+                    raise
+                reflection = Reflection(step_id=step.id,
+                                        insight=f"Hard failure: {e}",
+                                        pattern="unknown")
+                plan = await self._replan(task, plan, reflection)
+                replans += 1
+                idx = 0
+                continue
+
+            self.state = AgentState.VERIFYING
+            verification = await self._verify_step(step, step_result, task)
+
+            if not verification.passed:
+                self.state = AgentState.REFLECTING
+                reflection = await self._reflect(step, step_result, verification)
+                await self._emit(stream_id, "kernel.reflection",
+                                 {"step": step.id, "insight": reflection.insight})
+                if replans >= max_replans:
+                    await self.memory.record_episode(task.id, step, step_result, False)
+                    self._step_outputs.append(f"[UNVERIFIED] {step_result.summary}")
+                    idx += 1
+                    continue
+                plan = await self._replan(task, plan, reflection)
+                replans += 1
+                idx = 0
+                continue
+
+            await self.memory.record_episode(task.id, step, step_result, True)
+            self._step_outputs.append(step_result.summary or str(step_result.output)[:500])
+            await self._emit(stream_id, "kernel.step_ok",
+                             {"step": step.id, "summary": step_result.summary[:200]})
+            idx += 1
+
+        self.state = AgentState.DONE
+        final = await self._synthesize(task, plan)
+        og = await self.guardrails.check(final, {"phase": "output"})
+        if og.redacted_text:
+            final = og.redacted_text
+        return TaskResult(task_id=task.id, summary=final, plan=plan,
+                          artifacts=[{"step": s.id, "output": o}
+                                     for s, o in zip(plan.steps, self._step_outputs)])
+
+    async def _plan(self, task: Task, context: Context) -> Plan:
+        tools = self.tools.list_tools(self.spec.tools)
+        prompt = planning_prompt(task, context, tools,
+                                 self.spec.handoff_targets, self.spec.instructions)
+        raw = await self.llm.complete_json(prompt, temperature=0.1)
+        plan = Plan.parse(raw, available_tools=tools,
+                          available_agents=self.spec.handoff_targets)
+        if not plan.steps:
+            plan = Plan(goal=task.description, rationale="fallback single-shot plan",
+                        steps=[PlanStep(description="Reason about the task",
+                                        action=PlanStepAction.REASON,
+                                        prompt=task.description,
+                                        expected_outcome="An answer"),
+                               PlanStep(description="Finish",
+                                        action=PlanStepAction.FINISH)])
+        if plan.steps[-1].action != PlanStepAction.FINISH:
+            plan.steps.append(PlanStep(description="Finish",
+                                       action=PlanStepAction.FINISH))
+        return plan
+
+    async def _replan(self, task: Task, old_plan: Plan, reflection: Reflection) -> Plan:
+        tools = self.tools.list_tools(self.spec.tools)
+        prompt = replanning_prompt(task, old_plan, reflection,
+                                   tools, self.spec.handoff_targets)
+        raw = await self.llm.complete_json(prompt, temperature=0.1)
+        plan = Plan.parse(raw, available_tools=tools,
+                          available_agents=self.spec.handoff_targets)
+        plan.replan_count = old_plan.replan_count + 1
+        if not plan.steps:
+            plan = old_plan
+        if plan.steps and plan.steps[-1].action != PlanStepAction.FINISH:
+            plan.steps.append(PlanStep(description="Finish",
+                                       action=PlanStepAction.FINISH))
+        return plan
+
+    async def _execute_step(self, step, task, context) -> StepResult:
+        policy = self.spec.reliability_policy
+        return await self.reliability.execute_with_recovery(
+            operation=lambda: self._do_execute(step, task, context),
+            policy={**policy,
+                    "max_retries": min(policy["max_retries"], step.max_retries)},
+            context={"step": step.id, "agent": self.spec.agent_id})
+
+    async def _do_execute(self, step, task, context) -> StepResult:
+        if step.action == PlanStepAction.TOOL_CALL:
+            return await self._run_tool_step(step, task)
+        if step.action == PlanStepAction.HANDOFF:
+            return await self._run_handoff(step, task, context)
+        if step.action == PlanStepAction.REASON:
+            return await self._run_reason_step(step, context)
+        if step.action == PlanStepAction.ASK_HUMAN:
+            return await self._run_ask_human(step, task)
+        if step.action == PlanStepAction.FINISH:
+            return StepResult(action="finish", summary="Done", output="")
+        raise ValueError(f"Unknown action {step.action}")
+
+    async def _run_tool_step(self, step, task) -> StepResult:
+        if not step.tool_id:
+            picked = await self.llm.complete_json(
+                tool_selection_prompt(step.description,
+                                      self.tools.list_tools(self.spec.tools),
+                                      Context(working=[step.description])),
+                temperature=0.1)
+            if picked.get("tool_id"):
+                step.tool_id = picked["tool_id"]
+                step.arguments = picked.get("arguments", {}) or {}
+            else:
+                ans = picked.get("answer", "")
+                return StepResult(action="reason", output=ans,
+                                  summary=str(ans)[:200])
+        tool = self.tools.get(step.tool_id)
+        spec = tool.spec
+        if spec.dangerous or step.tool_id in self.spec.requires_approval_for:
+            decision = await self.approval.request(ApprovalRequest(
+                task_id=task.id, agent_id=self.spec.agent_id,
+                action=f"tool:{step.tool_id}", arguments=step.arguments,
+                reason="dangerous tool"))
+            if not decision.approved:
+                return StepResult(action="tool_call", success=False,
+                                  error=f"Denied by {decision.decided_by}",
+                                  summary=f"Tool {step.tool_id} denied")
+        res = await tool.invoke(step.arguments, sandbox=self.sandbox)
+        if not res.success:
+            raise RuntimeError(f"{res.error}")
+        summary = _summarize(res.output)
+        return StepResult(action="tool_call", output=res.output, summary=summary,
+                          artifacts=res.artifacts, tools_used=[step.tool_id],
+                          success=True)
+
+    async def _run_handoff(self, step, task, context) -> StepResult:
+        if not step.target_agent_id:
+            raise ValueError("Handoff step missing target_agent_id")
+        if self.orchestrator is None:
+            raise RuntimeError("Orchestrator reference not wired; cannot hand off")
+        sub = Task(description=step.subtask or step.description,
+                   domain=task.domain, parent_task_id=task.id)
+        target = self.orchestrator.agents.get(step.target_agent_id)
+        if target is None:
+            raise KeyError(f"Handoff target not registered: {step.target_agent_id}")
+        await self._emit(f"task:{task.id}", "kernel.handoff",
+                         {"from": self.spec.agent_id, "to": step.target_agent_id})
+        self.state = AgentState.HANDOFF
+        sub_result: TaskResult = await target.run(sub)
+        self.state = AgentState.EXECUTING
+        return StepResult(action="handoff", output=sub_result.summary,
+                          summary=f"[{step.target_agent_id}] {sub_result.summary[:400]}",
+                          success=sub_result.success, error=sub_result.error)
+
+    async def _run_reason_step(self, step, context) -> StepResult:
+        prompt = reasoning_prompt(step.prompt or step.description, context)
+        text = await self.llm.complete(prompt, temperature=self.spec.temperature)
+        return StepResult(action="reason", output=text,
+                          summary=text[:400] if text else "")
+
+    async def _run_ask_human(self, step, task) -> StepResult:
+        decision = await self.approval.request(ApprovalRequest(
+            task_id=task.id, agent_id=self.spec.agent_id, action="ask_human",
+            arguments={"question": step.description}, reason=step.description))
+        return StepResult(action="ask_human", output=decision.model_dump(),
+                          summary=f"Human decision: {decision.approved} ({decision.note})")
+
+    async def _verify_step(self, step, result, task) -> Verification:
+        checklist = self.spec.reliability_policy.get("verification_checklist", "default")
+        return await self.reliability.verify(
+            checklist=checklist, evidence=result.to_evidence(),
+            context={"step": step.model_dump(), "task": task.model_dump()})
+
+    async def _reflect(self, step, result, verification) -> Reflection:
+        pattern = self.reliability.match_failure(verification.failure_signals)
+        prompt = (f"A step in a plan failed.\n"
+                  f"Step: {step.description} (action={step.action.value})\n"
+                  f"Result summary: {result.summary}\n"
+                  f"Verification failure: {verification.reason}\n"
+                  f"Known failure pattern: {pattern.name if pattern else 'unknown'}\n"
+                  f"Explain in 2-3 sentences what went wrong and how the plan should change.")
+        insight = await self.llm.complete(prompt, temperature=0.3)
+        return Reflection(step_id=step.id, insight=insight,
+                          pattern=pattern.name if pattern else None)
+
+    async def _synthesize(self, task: Task, plan: Plan) -> str:
+        if not self._step_outputs:
+            return f"No output produced for task: {task.description}"
+        if len(self._step_outputs) == 1:
+            return self._step_outputs[0]
+        prompt = synthesis_prompt(task, plan, self._step_outputs)
+        return await self.llm.complete(prompt, temperature=0.2)
+
+    async def _emit(self, stream_id: str, etype: str, data: Dict[str, Any]) -> None:
+        await self.events.append(Event(stream_id=stream_id, type=etype,
+                                       data={"agent_id": self.spec.agent_id, **data}))
+
+
+def _summarize(output: Any, limit: int = 400) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output[:limit]
+    try:
+        return json.dumps(output, default=str)[:limit]
+    except Exception:
+        return str(output)[:limit]
+'''
+
+# ------------------------------------------------------------------ core/orchestrator.py
+FILES["core/orchestrator.py"] = r'''from __future__ import annotations
+import asyncio, logging
+from typing import Dict, List, Optional
+from .comm_bus import CommunicationBus
+from .events import Event, EventStore
+from .kernel import AgentKernel
+from .models import Task, TaskResult
+
+log = logging.getLogger("agentos.orchestrator")
+
+
+class Orchestrator:
+    def __init__(self, event_store: EventStore, comm_bus: CommunicationBus):
+        self.agents: Dict[str, AgentKernel] = {}
+        self.events = event_store
+        self.comm = comm_bus
+
+    def register_agent(self, kernel: AgentKernel) -> None:
+        kernel.orchestrator = self
+        self.agents[kernel.spec.agent_id] = kernel
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.events.append(Event(
+                stream_id="registry", type="agent.registered",
+                data={"agent_id": kernel.spec.agent_id,
+                      "role": kernel.spec.role.value})))
+        except RuntimeError:
+            pass
+        log.info("Registered agent: %s (%s)", kernel.spec.agent_id, kernel.spec.role.value)
+
+    async def run_task(self, task: Task, entry_agent_id: str) -> TaskResult:
+        if entry_agent_id not in self.agents:
+            raise KeyError(f"Unknown entry agent: {entry_agent_id}")
+        await self.events.append(Event(stream_id=f"task:{task.id}", type="task.submitted",
+                                       data={"agent_id": entry_agent_id,
+                                             "description": task.description}))
+        return await self.agents[entry_agent_id].run(task)
+
+    async def run_parallel(self, tasks: List[Task], agent_ids: List[str]) -> List[TaskResult]:
+        if len(tasks) != len(agent_ids):
+            raise ValueError("tasks and agent_ids length mismatch")
+        return await asyncio.gather(*(self.agents[a].run(t)
+                                      for a, t in zip(agent_ids, tasks)))
+
+    async def run_hierarchical(self, task: Task, coordinator_id: str) -> TaskResult:
+        return await self.run_task(task, coordinator_id)
+
+    def get_agent(self, agent_id: str) -> Optional[AgentKernel]:
+        return self.agents.get(agent_id)
+
+    def list_agents(self) -> List[dict]:
+        return [k.spec.model_dump() for k in self.agents.values()]
+'''
+
+# ------------------------------------------------------------------ core/factory.py
+FILES["core/factory.py"] = r'''from __future__ import annotations
+from typing import Optional
+from .agent import AgentSpec
+from .approval import ApprovalGate
+from .comm_bus import CommunicationBus
+from .events import EventStore
+from .guardrails import GuardrailChain
+from .kernel import AgentKernel
+from .llm import LLMClient
+from .memory import MemoryManager
+from .reliability import ReliabilityEngine
+from .tools import Sandbox, ToolRegistry
+
+
+class AgentFactory:
+    def __init__(self, llm: LLMClient, tools: ToolRegistry, event_store: EventStore,
+                 comm_bus: CommunicationBus,
+                 reliability: Optional[ReliabilityEngine] = None,
+                 approval_gate: Optional[ApprovalGate] = None,
+                 guardrails: Optional[GuardrailChain] = None,
+                 sandbox: Optional[Sandbox] = None,
+                 memory_persist_dir: Optional[str] = None):
+        self.llm = llm
+        self.tools = tools
+        self.events = event_store
+        self.comm = comm_bus
+        self.reliability = reliability or ReliabilityEngine()
+        self.approval = approval_gate or ApprovalGate(auto_approve_in_dev=False)
+        self.guardrails = guardrails or GuardrailChain()
+        self.sandbox = sandbox or Sandbox()
+        self.memory_persist_dir = memory_persist_dir
+
+    def build(self, spec: AgentSpec) -> AgentKernel:
+        cfg = dict(spec.memory_config)
+        if self.memory_persist_dir:
+            cfg.setdefault("persist_dir", self.memory_persist_dir)
+        memory = MemoryManager(cfg)
+        return AgentKernel(
+            spec=spec, llm=self.llm, tools=self.tools, memory=memory,
+            event_store=self.events, reliability=self.reliability,
+            comm_bus=self.comm, approval_gate=self.approval,
+            guardrails=self.guardrails, sandbox=self.sandbox)
+'''
+
+# ------------------------------------------------------------------ core/tracing.py
+FILES["core/tracing.py"] = r'''from __future__ import annotations
+import logging
+from typing import Optional
+
+log = logging.getLogger("agentos.tracing")
+_tracer = None
+
+
+def setup_tracing(service_name: str = "agentos", otlp_endpoint: Optional[str] = None):
+    global _tracer
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+        resource = Resource.create({"service.name": service_name})
+        provider = TracerProvider(resource=resource)
+        if otlp_endpoint:
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
+        else:
+            exporter = ConsoleSpanExporter()
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        trace.set_tracer_provider(provider)
+        _tracer = trace.get_tracer(service_name)
+        log.info("Tracing initialized for %s", service_name)
+        return _tracer
+    except Exception as e:
+        log.warning("Tracing unavailable: %s", e)
+        return None
+
+
+def get_tracer():
+    return _tracer
+'''
+
+# ------------------------------------------------------------------ core/worker.py
+FILES["core/worker.py"] = r'''from __future__ import annotations
+import asyncio, json, logging, os, signal
+from typing import Any, Dict
+
+log = logging.getLogger("agentos.worker")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+
+async def _handle_task(payload: Dict[str, Any], orchestrator) -> Dict[str, Any]:
+    from .models import Task
+    task = Task(id=payload["task_id"], description=payload["description"],
+                domain=payload.get("domain", "general"))
+    result = await orchestrator.run_task(task, payload["entry_agent_id"])
+    return result.model_dump()
+
+
+async def main():
+    from .approval import ApprovalGate
+    from .comm_bus import CommunicationBus
+    from .events import EventStore
+    from .factory import AgentFactory
+    from .llm import LLMClient
+    from .orchestrator import Orchestrator
+    from .tools import ToolRegistry
+    from demo.agents import build_demo_specs, register_demo_tools
+
+    tools = ToolRegistry()
+    register_demo_tools(tools)
+    events = EventStore(dsn=os.getenv("DATABASE_URL"))
+    await events.connect()
+    comm = CommunicationBus()
+    llm = LLMClient(model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                    api_key=os.getenv("OPENAI_API_KEY"))
+    factory = AgentFactory(llm=llm, tools=tools, event_store=events,
+                           comm_bus=comm,
+                           approval_gate=ApprovalGate(auto_approve_in_dev=True))
+    orch = Orchestrator(events, comm)
+    for spec in build_demo_specs():
+        orch.register_agent(factory.build(spec))
+
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        log.warning("REDIS_URL not set; running a single demo task instead of the queue loop")
+        from .models import Task
+        r = await orch.run_task(Task(description="Say hello and finish.",
+                                     domain="general"), "researcher-1")
+        print(json.dumps(r.model_dump(), indent=2, default=str))
+        return
+
+    import redis.asyncio as aioredis  # type: ignore
+    r = aioredis.from_url(redis_url, decode_responses=True)
+    queue = os.getenv("TASK_QUEUE", "agentos:tasks")
+    log.info("Worker listening on %s", queue)
+    stop = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(s, stop.set)
+        except NotImplementedError:
+            pass
+
+    while not stop.is_set():
+        try:
+            item = await r.blpop(queue, timeout=2)
+        except Exception as e:
+            log.error("Queue error: %s", e)
+            await asyncio.sleep(1)
+            continue
+        if not item:
+            continue
+        _, raw = item
+        try:
+            payload = json.loads(raw)
+            result = await _handle_task(payload, orch)
+            await r.publish(f"agentos:results:{payload['task_id']}",
+                            json.dumps(result, default=str))
+        except Exception as e:
+            log.exception("Task failed: %s", e)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+
+# ------------------------------------------------------------------ api/__init__.py
+FILES["api/__init__.py"] = r'''"""AgentOS HTTP API."""
+'''
+
+# ------------------------------------------------------------------ api/main.py
+FILES["api/main.py"] = r'''from __future__ import annotations
+import asyncio, logging, os
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
+
+from core.agent import AgentSpec
+from core.approval import ApprovalGate
+from core.comm_bus import CommunicationBus
+from core.events import EventStore
+from core.factory import AgentFactory
+from core.guardrails import GuardrailChain
+from core.llm import LLMClient
+from core.models import Task
+from core.orchestrator import Orchestrator
+from core.reliability import ReliabilityEngine
+from core.tools import Sandbox, ToolRegistry
+from core.tracing import setup_tracing
+from demo.agents import build_demo_specs, register_demo_tools
+
+log = logging.getLogger("agentos.api")
+logging.basicConfig(level=logging.INFO)
+
+STATE: Dict[str, Any] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_tracing("agentos")
+    tools = ToolRegistry()
+    register_demo_tools(tools)
+    events = EventStore(dsn=os.getenv("DATABASE_URL"))
+    await events.connect()
+    comm = CommunicationBus()
+    approval = ApprovalGate(
+        auto_approve_in_dev=os.getenv("AUTO_APPROVE", "true") == "true",
+        timeout_seconds=int(os.getenv("APPROVAL_TIMEOUT", "600")))
+    llm = LLMClient(model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                    api_key=os.getenv("OPENAI_API_KEY"))
+    factory = AgentFactory(
+        llm=llm, tools=tools, event_store=events, comm_bus=comm,
+        reliability=ReliabilityEngine(), approval_gate=approval,
+        guardrails=GuardrailChain(), sandbox=Sandbox(prefer_docker=False),
+        memory_persist_dir=os.getenv("CHROMA_DIR"))
+    orch = Orchestrator(events, comm)
+    for spec in build_demo_specs():
+        orch.register_agent(factory.build(spec))
+    STATE.update(dict(tools=tools, events=events, comm=comm, approval=approval,
+                      llm=llm, factory=factory, orch=orch))
+    log.info("AgentOS ready with %d agents", len(orch.agents))
+    yield
+    STATE.clear()
+
+
+app = FastAPI(title="AgentOS", version="1.0.0", lifespan=lifespan)
+
+
+class TaskRequest(BaseModel):
+    description: str
+    entry_agent_id: str = "researcher-1"
+    domain: str = "general"
+
+
+class TaskResponse(BaseModel):
+    task_id: str
+    success: bool
+    summary: str
+    plan: Optional[dict] = None
+    artifacts: List[dict] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+class ApprovalResolve(BaseModel):
+    request_id: str
+    approved: bool
+    decided_by: str = "user"
+    note: str = ""
+
+
+@app.post("/v1/tasks", response_model=TaskResponse)
+async def submit_task(req: TaskRequest):
+    orch: Orchestrator = STATE["orch"]
+    if req.entry_agent_id not in orch.agents:
+        raise HTTPException(404, f"Unknown entry agent: {req.entry_agent_id}")
+    task = Task(description=req.description, domain=req.domain)
+    result = await orch.run_task(task, req.entry_agent_id)
+    return TaskResponse(task_id=result.task_id, success=result.success,
+                        summary=result.summary,
+                        plan=result.plan.model_dump() if result.plan else None,
+                        artifacts=result.artifacts, error=result.error)
+
+
+@app.get("/v1/tasks/{task_id}/events")
+async def get_task_events(task_id: str):
+    events: EventStore = STATE["events"]
+    evs = await events.get_events(f"task:{task_id}")
+    return {"events": [e.model_dump() for e in evs]}
+
+
+@app.get("/v1/agents")
+async def list_agents():
+    orch: Orchestrator = STATE["orch"]
+    return {"agents": orch.list_agents()}
+
+
+@app.post("/v1/agents")
+async def create_agent(spec: AgentSpec):
+    orch: Orchestrator = STATE["orch"]
+    factory: AgentFactory = STATE["factory"]
+    if spec.agent_id in orch.agents:
+        raise HTTPException(409, f"Agent {spec.agent_id} already exists")
+    kernel = factory.build(spec)
+    orch.register_agent(kernel)
+    return {"agent_id": spec.agent_id, "status": "registered"}
+
+
+@app.get("/v1/agents/{agent_id}")
+async def get_agent(agent_id: str):
+    orch: Orchestrator = STATE["orch"]
+    a = orch.get_agent(agent_id)
+    if not a:
+        raise HTTPException(404, "Agent not found")
+    return {"spec": a.spec.model_dump(), "state": a.state.value}
+
+
+@app.get("/v1/tools")
+async def list_tools():
+    tools: ToolRegistry = STATE["tools"]
+    return {"tools": [t.model_dump() for t in tools.list_tools()]}
+
+
+@app.get("/v1/approvals")
+async def list_approvals():
+    gate: ApprovalGate = STATE["approval"]
+    return {"pending": [r.model_dump() for r in gate.requests.values()]}
+
+
+@app.post("/v1/approvals/resolve")
+async def resolve_approval(req: ApprovalResolve):
+    gate: ApprovalGate = STATE["approval"]
+    ok = gate.resolve(req.request_id, req.approved, req.decided_by, req.note)
+    if not ok:
+        raise HTTPException(404, "Approval request not found or already resolved")
+    return {"status": "resolved", "request_id": req.request_id}
+
+
+@app.get("/health")
+async def health():
+    orch: Orchestrator = STATE.get("orch")
+    return {"status": "ok", "agents": len(orch.agents) if orch else 0}
+
+
+@app.websocket("/ws/tasks/{task_id}")
+async def ws_task_events(websocket: WebSocket, task_id: str):
+    await websocket.accept()
+    events: EventStore = STATE["events"]
+    last_version = 0
+    try:
+        while True:
+            new = await events.get_events(f"task:{task_id}", after_version=last_version)
+            for e in new:
+                await websocket.send_json(e.model_dump())
+                last_version = e.version
+            if new and new[-1].type in ("kernel.completed", "kernel.failed", "kernel.timeout"):
+                break
+            await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        return
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+'''
+
+# ------------------------------------------------------------------ demo/__init__.py
+FILES["demo/__init__.py"] = r'''"""Demo agents, tools, and scripts."""
+'''
+
+# ------------------------------------------------------------------ demo/agents.py
+FILES["demo/agents.py"] = r'''from __future__ import annotations
+import ast, io, json, sys, urllib.parse, urllib.request
+from typing import Any, Dict, List
+
+from core.agent import AgentRole, AgentSpec
+from core.tools import FunctionTool, ToolSpec, ToolRegistry
+
+
+def web_search(query: str) -> str:
+    url = "https://api.duckduckgo.com/?" + urllib.parse.urlencode({
+        "q": query, "format": "json", "no_html": 1, "skip_disambig": 1})
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        abstract = data.get("AbstractText") or ""
+        related = [t.get("Text") for t in data.get("RelatedTopics", [])
+                   if isinstance(t, dict)][:5]
+        return json.dumps({"query": query, "abstract": abstract, "related": related,
+                           "source": data.get("AbstractURL", "https://duckduckgo.com")})
+    except Exception as e:
+        return json.dumps({"query": query, "error": str(e), "source": "duckduckgo"})
+
+
+def run_python(code: str) -> Dict[str, Any]:
+    safe_globals = {
+        "__builtins__": {
+            "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
+            "range": range, "print": print, "int": int, "float": float,
+            "str": str, "list": list, "dict": dict, "set": set, "tuple": tuple,
+            "bool": bool, "enumerate": enumerate, "zip": zip, "map": map,
+            "filter": filter, "sorted": sorted, "any": any, "all": all,
+            "round": round, "pow": pow, "divmod": divmod, "isinstance": isinstance,
+        },
+        "math": __import__("math"),
+        "statistics": __import__("statistics"),
+    }
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        tree = ast.parse(code, mode="exec")
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                raise ValueError("imports are disabled")
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and \
+               node.func.id in {"exec", "eval", "open", "__import__", "compile"}:
+                raise ValueError(f"{node.func.id} is disabled")
+        exec(compile(tree, "<sandbox>", "exec"), safe_globals, {})
+        return {"stdout": buf.getvalue(), "ok": True}
+    except Exception as e:
+        return {"stdout": buf.getvalue(), "ok": False,
+                "error": f"{type(e).__name__}: {e}"}
+    finally:
+        sys.stdout = old
+
+
+def write_file(path: str, content: str) -> str:
+    import os, tempfile
+    base = tempfile.gettempdir()
+    safe = os.path.normpath(os.path.join(base, path)).replace("..", "")
+    d = os.path.dirname(safe)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(safe, "w", encoding="utf-8") as f:
+        f.write(content)
+    return f"Wrote {len(content)} bytes to {safe}"
+
+
+def register_demo_tools(registry: ToolRegistry) -> None:
+    registry.register(FunctionTool(
+        ToolSpec(tool_id="web_search", name="web_search",
+                 description="Search the web via DuckDuckGo Instant Answer API.",
+                 parameters={"type": "object",
