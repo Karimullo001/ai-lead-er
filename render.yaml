@@ -100,7 +100,7 @@ services:
     name: agentos-redis
     plan: free
     region: frankfurt
-    maxmemoryPolicy: allkeys_lru
+    maxmemoryPolicy: noeviction
     ipAllowList: []
 
 databases:
