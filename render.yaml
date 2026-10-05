@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: agentos-api
+    name: agentos-api-v2
     runtime: python
     plan: free
     buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
