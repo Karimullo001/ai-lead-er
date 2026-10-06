@@ -418,22 +418,36 @@ AGENTOS_EXECUTION_LOCK = "agentos:execution:lock"
         qp.write_text(q, encoding="utf-8")
 
 # 3) Worker uses the global lock and never ACKs a message until the task is
-#    actually terminal. A lock TTL protects against crashes.
+#    actually terminal. The lock is acquired before stream claim so FIFO is
+#    preserved across rolling deploys; a refresher prevents long tasks from
+#    losing the lease.
 wp = ROOT / "core/worker.py"
 if wp.exists():
     w = wp.read_text(encoding="utf-8")
     if "execution_lock_owner" not in w:
         w = w.replace(
-'''            try:
+'''from __future__ import annotations
+import asyncio, logging, os, signal, sys, time
+''',
+'''from __future__ import annotations
+import asyncio, logging, os, signal, sys, time, uuid
+''', 1)
+        old = '''            try:
                 await self._run_task(task_id)
                 await self.queue.ack(entry_id)
             except Exception as e:
-''',
-'''            owner = f"{self.name}:{entry_id}"
+                log.exception("Task %s crashed", task_id)
+                await self.tm.set_status(task_id, TaskStatus.FAILED, error=str(e))
+                await self.queue.to_dlq(entry_id, task_id, str(e))
+'''
+        new = '''            owner = f"{self.name}:{uuid.uuid4().hex}"
             locked = False
+            refresh_task = None
+            entry_id = None
+            task_id = None
             try:
-                # FIFO execution: wait for the current task to finish instead
-                # of starting a second task concurrently.
+                # Lock BEFORE claim: only one worker can consume the next FIFO
+                # entry at a time.
                 while not self.stop.is_set():
                     locked = await self.queue.acquire_execution_lock(owner)
                     if locked:
@@ -441,21 +455,51 @@ if wp.exists():
                     await asyncio.sleep(0.5)
                 if not locked:
                     continue
+
+                msg = await self.queue.claim_one(block_ms=3000)
+                if not msg:
+                    await self.queue.release_execution_lock(owner)
+                    locked = False
+                    continue
+
+                entry_id = msg["entry_id"]
+                task_id = msg["data"].get("task_id")
+                if not task_id:
+                    await self.queue.to_dlq(entry_id, "?", "missing task_id")
+                    continue
+
+                async def _refresh_lock():
+                    while True:
+                        await asyncio.sleep(60)
+                        if not await self.queue.refresh_execution_lock(owner, ttl_seconds=1800):
+                            log.warning("Execution lock refresh lost for %s", owner)
+                            return
+
+                refresh_task = asyncio.create_task(_refresh_lock())
                 await self._run_task(task_id)
                 await self.queue.ack(entry_id)
             except Exception as e:
-''', 1)
-        w = w.replace(
-'''                await self.queue.to_dlq(entry_id, task_id, str(e))
-''',
-'''                await self.queue.to_dlq(entry_id, task_id, str(e))
+                log.exception("Task %s crashed", task_id or "?")
+                if task_id:
+                    await self.tm.set_status(task_id, TaskStatus.FAILED, error=str(e))
+                    if entry_id:
+                        await self.queue.to_dlq(entry_id, task_id, str(e))
             finally:
+                if refresh_task:
+                    refresh_task.cancel()
+                    try:
+                        await refresh_task
+                    except asyncio.CancelledError:
+                        pass
                 if locked:
                     try:
                         await self.queue.release_execution_lock(owner)
                     except Exception:
                         log.exception("Failed to release execution lock")
-''', 1)
+'''
+        if old not in w:
+            raise SystemExit("generated worker task loop pattern not found")
+        w = w.replace(old, new, 1)
         wp.write_text(w, encoding="utf-8")
 
 # 4) Persistent long-term memory. Completed task summaries become searchable
