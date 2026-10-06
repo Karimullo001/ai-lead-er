@@ -1862,6 +1862,45 @@ async def nl_handler(message: Message):
     await _create_task_and_ack(message, text)
 
 
+
+async def _task_progress_loop(task_id: str, chat_id: int, message_id: int) -> None:
+    tm: TaskManager = STATE["tm"]
+    bot = STATE.get("bot")
+    if bot is None:
+        return
+    last = None
+    while True:
+        try:
+            row = await tm.get_task(task_id)
+            if not row:
+                return
+            status = str(row.get("status") or "QUEUED")
+            progress = float(row.get("progress") or 0.0)
+            if status == "COMPLETED":
+                progress = 100.0
+            filled = int(max(0.0, min(100.0, progress)) / 5.0)
+            bar = "█" * filled + "░" * (20 - filled)
+            labels = {"QUEUED":"⏳ Queued","RUNNING":"🤖 Working","PAUSED":"⏸ Paused","WAITING_APPROVAL":"🔐 Waiting for approval","COMPLETED":"✅ Completed","FAILED":"❌ Failed","CANCELLED":"🛑 Cancelled"}
+            label = labels.get(status, status)
+            if status == "COMPLETED":
+                text = "🤖 AgentOS\\n\\n" + bar + " 100%\\n\\n✅ Task completed\\nID: " + task_id[:8]
+            elif status == "FAILED":
+                text = "🤖 AgentOS\\n\\n" + bar + " " + ("%.0f" % progress) + "%\\n\\n❌ Task failed\\nID: " + task_id[:8] + "\\n\\nError: " + str(row.get("error") or "unknown")[:1000]
+            else:
+                text = "🤖 AgentOS\\n\\n" + bar + " " + ("%.0f" % progress) + "%\\n\\n" + label + "\\nID: " + task_id[:8]
+            if text != last:
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+                    last = text
+                except Exception:
+                    pass
+            if status in ("COMPLETED", "FAILED", "CANCELLED"):
+                return
+        except Exception as e:
+            log.debug("task progress loop %s: %s", task_id, e)
+        await asyncio.sleep(2)
+
+
 async def _create_task_and_ack(message: Message, text: str):
     tm: TaskManager = STATE["tm"]
     q: TaskQueue = STATE["queue"]
@@ -1873,10 +1912,14 @@ async def _create_task_and_ack(message: Message, text: str):
     await tm.set_status(tid, TaskStatus.QUEUED)
     await tm.audit(str(user_id), "task.created", {"task_id": tid})
     short = tid[:8]
-    await message.answer(
-        f"✅ Task accepted. I'll work on it in the background.\n"
-        f"ID: `{short}`\n\nYou can close Telegram — I'll notify you here when done.",
-        parse_mode="Markdown")
+    sent = await message.answer(
+        "🤖 AgentOS is working...\\n\\n"
+        "░░░░░░░░░░░░░░░░░░░░ 0%\\n\\n"
+        "⏳ Queued\\n"
+        + "ID: " + short + "\\n\\n"
+        + "Live progress will update here.")
+    asyncio.create_task(_task_progress_loop(tid, chat_id, sent.message_id),
+                        name="task-progress-" + short)
 
 
 # ---------------- /tasks ----------------
@@ -2206,6 +2249,7 @@ async def main() -> None:
 
     # --- aiogram ---
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+    STATE["bot"] = bot
     dp = Dispatcher()
     dp.message.middleware(AuthMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
