@@ -104,6 +104,20 @@ async def start_hosted_runtime() -> Dict[str, Any]:
             _telegram_runtime(), name="agentos-telegram-embedded"
         )
 
+        def _report_task_result(task: asyncio.Task) -> None:
+            if task.cancelled():
+                log.info("Embedded Telegram task cancelled")
+                return
+            exc = task.exception()
+            if exc:
+                log.exception("Embedded Telegram task crashed", exc_info=exc)
+            else:
+                log.warning("Embedded Telegram task exited unexpectedly")
+
+        telegram_task.add_done_callback(_report_task_result)
+    else:
+        log.warning("TELEGRAM_BOT_TOKEN is missing; Telegram task not started")
+
     log.info("AgentOS single-service runtime started: worker=%s telegram=%s",
              True, bool(telegram_task))
     return {"worker": worker, "worker_task": worker_task, "telegram_task": telegram_task}
