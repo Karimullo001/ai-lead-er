@@ -77,9 +77,15 @@ async def _telegram_runtime():
     dp.callback_query.middleware(AuthMiddleware())
     dp.include_router(router)
 
-    log.info("AgentOS embedded Telegram service: starting polling")
+    log.info("Telegram polling starting")
     try:
+        me = await bot.get_me()
+        log.info("Telegram bot connected as @%s", me.username or me.id)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Telegram polling stopped with an error")
     finally:
         await notifier.stop()
         await bot.session.close()
