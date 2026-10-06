@@ -154,19 +154,23 @@ async def _worker_runtime() -> None:
 
 async def _supervisor(worker_executor: ThreadPoolExecutor) -> None:
     log.info("Hosted runtime supervisor starting")
-    worker_task = asyncio.get_running_loop().run_in_executor(
-        worker_executor, _worker_thread_entry
-    )
-    telegram_task = None
 
+    # Start Telegram first. Worker initialization can be CPU-heavy and must
+    # never delay the Telegram event loop.
     telegram_task = asyncio.create_task(
         _telegram_runtime(), name="agentos-telegram-embedded"
     )
 
-    tasks = [worker_task] + ([telegram_task] if telegram_task else [])
+    await asyncio.sleep(0.25)
+
+    worker_task = asyncio.get_running_loop().run_in_executor(
+        worker_executor, _worker_thread_entry
+    )
+
+    tasks = [telegram_task, worker_task]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for name, result in zip(("worker", "telegram"), results):
+    for name, result in zip(("telegram", "worker"), results):
         if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
             log.error("Hosted %s task crashed: %r", name, result)
         else:
