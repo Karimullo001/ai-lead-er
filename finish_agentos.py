@@ -911,3 +911,23 @@ if llp.exists():
 if not compileall.compile_dir(str(ROOT), quiet=1):
     raise SystemExit("Native tool-call preservation patch failed Python compilation")
 print("AgentOS native tool calls preserved")
+
+
+# Render entrypoint: api.main already owns the embedded worker/Telegram
+# lifespan. Do not wrap it a second time, which starts a duplicate runtime
+# and can prevent Uvicorn from completing startup.
+hs = ROOT / "hosted_start.py"
+hs.write_text(r'''"""Single-process Render entrypoint for AgentOS."""
+from __future__ import annotations
+
+import os
+import uvicorn
+from api.main import app
+
+uvicorn.run(
+    app,
+    host="0.0.0.0",
+    port=int(os.getenv("PORT", "10000")),
+    log_level=os.getenv("LOG_LEVEL", "info"),
+)
+''', encoding="utf-8")
