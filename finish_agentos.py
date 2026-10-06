@@ -281,6 +281,9 @@ async def _telegram_loop(tm, queue, router_model, orch):
             except Exception:
                 pass
 
+_telegram_seen_updates: set[int] = set()
+_telegram_seen_order: list[int] = []
+
 async def handle_telegram_webhook(payload: dict, secret_header: str | None = None):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     log.info("Telegram webhook request received: has_secret=%s payload_keys=%s", bool(secret_header), sorted(payload.keys()) if isinstance(payload, dict) else [])
@@ -298,8 +301,19 @@ async def handle_telegram_webhook(payload: dict, secret_header: str | None = Non
         return False
     try:
         update = _AgentOSUpdate.model_validate(payload)
+        # Telegram may retry a webhook delivery if processing is slow. Never
+        # execute the same update twice.
+        update_id = int(update.update_id)
+        if update_id in _telegram_seen_updates:
+            log.info("Telegram duplicate update ignored: %s", update_id)
+            return True
+        _telegram_seen_updates.add(update_id)
+        _telegram_seen_order.append(update_id)
+        if len(_telegram_seen_order) > 1000:
+            old_id = _telegram_seen_order.pop(0)
+            _telegram_seen_updates.discard(old_id)
         await dp.feed_update(bot, update)
-        log.info("Telegram webhook update processed")
+        log.info("Telegram webhook update processed: %s", update_id)
         return True
     except Exception:
         log.exception("Telegram webhook update processing failed")
