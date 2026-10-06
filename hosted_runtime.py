@@ -137,9 +137,8 @@ async def _worker_runtime() -> None:
 async def _supervisor() -> None:
     log.info("Hosted runtime supervisor starting")
     worker_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentos-worker")
-    worker_task = asyncio.create_task(
-        asyncio.get_running_loop().run_in_executor(worker_executor, _worker_thread_entry),
-        name="agentos-worker-embedded",
+    worker_task = asyncio.get_running_loop().run_in_executor(
+        worker_executor, _worker_thread_entry
     )
     telegram_task = None
 
