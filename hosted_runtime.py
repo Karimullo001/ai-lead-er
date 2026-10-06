@@ -50,6 +50,7 @@ async def _telegram_runtime() -> None:
     await queue.connect()
     log.info("Telegram runtime: Redis connected")
 
+    log.info("Telegram runtime: building handler dependencies")
     tools = ToolRegistry()
     register_demo_tools(tools)
     events = EventStore(dsn=dsn)
@@ -57,6 +58,7 @@ async def _telegram_runtime() -> None:
     log.info("Telegram runtime: EventStore connected")
     comm = CommunicationBus()
     router_model = ModelRouter()
+    log.info("Telegram runtime: ModelRouter ready")
     llm = LLMClient(router=router_model)
     approval = ApprovalGate(
         auto_approve_in_dev=os.getenv("AUTO_APPROVE", "false").lower() == "true"
@@ -71,8 +73,10 @@ async def _telegram_runtime() -> None:
         sandbox=Sandbox(prefer_docker=False),
     )
     orch = Orchestrator(events, comm)
+    log.info("Telegram runtime: registering handler agents")
     for spec in build_demo_specs():
         orch.register_agent(factory.build(spec))
+    log.info("Telegram runtime: handler agents ready")
 
     notifier = get_notifier()
     await notifier.start()
