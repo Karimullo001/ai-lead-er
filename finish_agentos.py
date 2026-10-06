@@ -202,3 +202,121 @@ if ap.exists():
 if not compileall.compile_dir(str(ROOT),quiet=1):
     raise SystemExit("AgentOS final pass failed Python compilation")
 print("AgentOS final pass: web research + documents + video + artifact validation + healthz")
+
+
+# AgentOS webhook runtime patch: Render web services should use Telegram webhooks
+# instead of long-polling, which eliminates deployment-time getUpdates conflicts.
+hr = ROOT / "hosted_runtime.py"
+if hr.exists():
+    h = hr.read_text(encoding="utf-8")
+    if "AgentOS webhook runtime patch" not in h:
+        h += r'''
+# AgentOS webhook runtime patch
+import hashlib as _agentos_hashlib
+from aiogram.types import Update as _AgentOSUpdate
+
+async def _telegram_loop(tm, queue, router_model, orch):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        log.warning("TELEGRAM_BOT_TOKEN missing; Telegram disabled")
+        return
+    notifier = get_notifier()
+    bot = None
+    notif_task = None
+    try:
+        if notifier._bot is None:
+            await notifier.start()
+        bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+        STATE.update(dict(tm=tm, queue=queue, router=router_model, orch=orch,
+                          notifier=notifier, bot=bot))
+        dp = Dispatcher()
+        dp.message.middleware(AuthMiddleware())
+        dp.callback_query.middleware(AuthMiddleware())
+        dp.include_router(router)
+        _runtime["bot"] = bot
+        _runtime["dispatcher"] = dp
+        external = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+        if external:
+            secret = _agentos_hashlib.sha256(token.encode()).hexdigest()
+            webhook = external + "/telegram/webhook"
+            await bot.set_webhook(
+                webhook,
+                secret_token=secret,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=False,
+            )
+            _runtime["telegram_ready"] = True
+            log.info("Telegram webhook connected at %s", webhook)
+            notif_task = asyncio.create_task(_status_notifier_loop(tm, notifier))
+            while not _runtime.get("stopping"):
+                await asyncio.sleep(5)
+        else:
+            # Local fallback: keep the existing polling behavior.
+            await bot.delete_webhook(drop_pending_updates=False)
+            _runtime["telegram_ready"] = True
+            notif_task = asyncio.create_task(_status_notifier_loop(tm, notifier))
+            await dp.start_polling(
+                bot, allowed_updates=dp.resolve_used_update_types(),
+                handle_signals=False,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _runtime["telegram_ready"] = False
+        log.exception("Telegram runtime failed: %s", exc)
+    finally:
+        if notif_task:
+            notif_task.cancel()
+            try:
+                await notif_task
+            except asyncio.CancelledError:
+                pass
+        if bot:
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+
+async def handle_telegram_webhook(payload: dict, secret_header: str | None = None):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token or not secret_header:
+        return False
+    expected = _agentos_hashlib.sha256(token.encode()).hexdigest()
+    if secret_header != expected:
+        return False
+    dp = _runtime.get("dispatcher")
+    bot = _runtime.get("bot")
+    if not dp or not bot:
+        return False
+    update = _AgentOSUpdate.model_validate(payload)
+    await dp.feed_update(bot, update)
+    return True
+'''
+        hr.write_text(h, encoding="utf-8")
+
+# Install the webhook HTTP endpoint after hosted_runtime has been generated.
+ap = ROOT / "api/main.py"
+if ap.exists():
+    a = ap.read_text(encoding="utf-8")
+    if "/telegram/webhook" not in a:
+        a += r'''
+# Telegram webhook endpoint. Authentication is performed by hosted_runtime
+# using a token-derived secret header; invalid requests are rejected.
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    secret = request.headers.get("x-telegram-bot-api-secret-token")
+    payload = await request.json()
+    from hosted_runtime import handle_telegram_webhook
+    ok = await handle_telegram_webhook(payload, secret)
+    if not ok:
+        return JSONResponse({"ok": False}, status_code=403)
+    return {"ok": True}
+'''
+        ap.write_text(a, encoding="utf-8")
