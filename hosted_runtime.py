@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 log = logging.getLogger("agentos.hosted")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -111,6 +112,11 @@ async def _telegram_runtime() -> None:
         log.info("Telegram runtime stopped")
 
 
+def _worker_thread_entry() -> None:
+    """Run the worker on its own event loop so a blocking worker loop cannot starve Telegram."""
+    asyncio.run(_worker_runtime())
+
+
 async def _worker_runtime() -> None:
     from core.worker import Worker
 
@@ -130,7 +136,11 @@ async def _worker_runtime() -> None:
 
 async def _supervisor() -> None:
     log.info("Hosted runtime supervisor starting")
-    worker_task = asyncio.create_task(_worker_runtime(), name="agentos-worker-embedded")
+    worker_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentos-worker")
+    worker_task = asyncio.create_task(
+        asyncio.get_running_loop().run_in_executor(worker_executor, _worker_thread_entry),
+        name="agentos-worker-embedded",
+    )
     telegram_task = None
 
     telegram_task = asyncio.create_task(
@@ -151,7 +161,7 @@ async def start_hosted_runtime() -> dict[str, Any]:
     supervisor = asyncio.create_task(_supervisor(), name="agentos-hosted-supervisor")
     supervisor.add_done_callback(_report_supervisor)
     log.info("AgentOS hosted supervisor launched")
-    return {"supervisor_task": supervisor}
+    return {"supervisor_task": supervisor, "worker_executor": worker_executor}
 
 
 def _report_supervisor(task: asyncio.Task) -> None:
@@ -170,4 +180,7 @@ async def stop_hosted_runtime(runtime: dict[str, Any]) -> None:
     if task:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    executor = runtime.get("worker_executor")
+    if executor:
+        executor.shutdown(wait=False, cancel_futures=True)
     log.info("Hosted runtime stopped")
