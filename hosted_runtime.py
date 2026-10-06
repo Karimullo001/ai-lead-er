@@ -32,7 +32,6 @@ async def _telegram_runtime() -> None:
     from core.tools import Sandbox, ToolRegistry
     from demo.agents import build_demo_specs, register_demo_tools
     from telegram_bot.handlers import STATE, router
-    from telegram_bot.notifier import get_notifier
     from telegram_bot.security import AuthMiddleware
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -79,10 +78,29 @@ async def _telegram_runtime() -> None:
         orch.register_agent(factory.build(spec))
     log.info("Telegram runtime: handler agents ready")
 
-    notifier = get_notifier()
-    log.info("Telegram runtime: notifier object ready")
-    await notifier.start()
-    log.info("Telegram runtime: notifier ready")
+    class LazyNotifier:
+        def __init__(self, bot_token: str):
+            self.token = bot_token
+            self.bot = None
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            if self.bot:
+                await self.bot.session.close()
+                self.bot = None
+
+        async def send(self, chat_id, text, reply_markup=None):
+            if self.bot is None:
+                self.bot = Bot(self.token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+            try:
+                await self.bot.send_message(int(chat_id), text[:4000], reply_markup=reply_markup)
+            except Exception:
+                log.exception("Telegram notification send failed")
+
+    notifier = LazyNotifier(token)
+    log.info("Telegram runtime: lazy notifier ready")
     STATE.update(
         tm=tm, queue=queue, router=router_model, orch=orch,
         approval=approval, notifier=notifier, redis_url=redis_url
