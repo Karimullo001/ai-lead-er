@@ -134,9 +134,8 @@ async def _worker_runtime() -> None:
             log.exception("Embedded worker shutdown failed")
 
 
-async def _supervisor() -> None:
+async def _supervisor(worker_executor: ThreadPoolExecutor) -> None:
     log.info("Hosted runtime supervisor starting")
-    worker_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentos-worker")
     worker_task = asyncio.get_running_loop().run_in_executor(
         worker_executor, _worker_thread_entry
     )
@@ -157,7 +156,8 @@ async def _supervisor() -> None:
 
 
 async def start_hosted_runtime() -> dict[str, Any]:
-    supervisor = asyncio.create_task(_supervisor(), name="agentos-hosted-supervisor")
+    worker_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentos-worker")
+    supervisor = asyncio.create_task(_supervisor(worker_executor), name="agentos-hosted-supervisor")
     supervisor.add_done_callback(_report_supervisor)
     log.info("AgentOS hosted supervisor launched")
     return {"supervisor_task": supervisor, "worker_executor": worker_executor}
