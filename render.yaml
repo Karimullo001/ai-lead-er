@@ -3,7 +3,7 @@ services:
     name: agentos-api-v2
     runtime: python
     plan: free
-    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && python enhance_agentos.py && python patch_single_service.py && pip install -e .
+    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && python enhance_agentos.py && python finish_agentos.py && python patch_single_service.py && pip install -e .
     startCommand: python hosted_start.py
     envVars:
       - key: DATABASE_URL
