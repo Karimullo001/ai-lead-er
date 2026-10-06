@@ -312,3 +312,87 @@ def patch_expert_menu(s):
     return s.replace(needle,needle+'\n        BotCommand(command="expert", description="Expert mode"),',1)
 
 patch_file("telegram_bot/bot.py",patch_expert_menu)
+
+def patch_media_handlers(s):
+    if "async def _media_task" in s:
+        return s
+    imports = '''\nimport tempfile, mimetypes\n'''
+    if "import tempfile" not in s:
+        s=s.replace("import logging, os, time", "import logging, os, time"+imports, 1)
+    marker="async def _task_progress_loop"
+    block=r'''
+async def _media_task(message: Message, kind: str) -> None:
+    """Turn Telegram media into a normal AgentOS task with durable media context."""
+    bot = STATE.get("bot")
+    if bot is None:
+        await message.answer("⚠️ Media runtime is not ready yet. Please retry.")
+        return
+    try:
+        suffix = ".bin"
+        tg_file_id = None
+        if kind == "voice" and message.voice:
+            tg_file_id = message.voice.file_id; suffix = ".ogg"
+        elif kind == "audio" and message.audio:
+            tg_file_id = message.audio.file_id; suffix = mimetypes.guess_extension(message.audio.mime_type or "") or ".mp3"
+        elif kind == "photo" and message.photo:
+            tg_file_id = message.photo[-1].file_id; suffix = ".jpg"
+        elif kind == "video" and message.video:
+            tg_file_id = message.video.file_id; suffix = ".mp4"
+        elif kind == "document" and message.document:
+            tg_file_id = message.document.file_id; suffix = mimetypes.guess_extension(message.document.mime_type or "") or ".bin"
+        if not tg_file_id:
+            await message.answer("⚠️ I couldn't read that media.")
+            return
+        tg = await bot.get_file(tg_file_id)
+        path = tempfile.mktemp(prefix="agentos_media_", suffix=suffix)
+        await bot.download(tg, destination=path)
+
+        analysis = ""
+        if kind in ("voice", "audio", "photo"):
+            try:
+                from core.media_ingest import analyze
+                analysis = await analyze(path, "audio" if kind in ("voice","audio") else "image")
+            except Exception as exc:
+                analysis = "Media analysis unavailable: " + type(exc).__name__
+
+        caption = (message.caption or "").strip()
+        prompt = (
+            f"User sent a {kind} attachment. "
+            f"Use the attached local media at {path} when tools support it. "
+            f"Analyze it and answer the user's request. "
+            f"Caption/request: {caption or '(no caption; infer the useful task)'}"
+        )
+        if analysis:
+            prompt += "
+
+Pre-analysis from multimodal ingestion:
+" + analysis[:12000]
+        await _create_task_and_ack(message, prompt)
+    except Exception as exc:
+        log.exception("media ingestion failed")
+        await message.answer("⚠️ Media received, but ingestion failed safely. Please retry once.")
+
+@router.message(F.voice)
+async def voice_handler(message: Message):
+    await _media_task(message, "voice")
+
+@router.message(F.audio)
+async def audio_handler(message: Message):
+    await _media_task(message, "audio")
+
+@router.message(F.photo)
+async def photo_handler(message: Message):
+    await _media_task(message, "photo")
+
+@router.message(F.video)
+async def video_handler(message: Message):
+    await _media_task(message, "video")
+
+@router.message(F.document)
+async def document_handler(message: Message):
+    await _media_task(message, "document")
+
+'''
+    return s.replace(marker,block+marker,1)
+
+patch_file("telegram_bot/handlers.py", patch_media_handlers)
