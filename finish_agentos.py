@@ -915,14 +915,16 @@ print("AgentOS native tool calls preserved")
 
 
 
-# Render entrypoint: boot the hosted runtime in the background so Uvicorn can
-# bind its port immediately even if database/model initialization is slow.
+
+# Render entrypoint: use a lifespan wrapper that starts AgentOS asynchronously,
+# allowing Uvicorn to bind its port before worker/database initialization ends.
 hs = ROOT / "hosted_start.py"
 hs.write_text(r'''"""Single-process Render entrypoint for AgentOS."""
 from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 
 import uvicorn
 
@@ -930,42 +932,45 @@ os.environ["EMBEDDED_RUNTIME"] = "false"
 
 from api.main import app
 
-async def _boot_runtime():
-    from hosted_runtime import start_hosted_runtime
-    state = await start_hosted_runtime()
-    app.state.agentos_runtime = state
-    return state
+@asynccontextmanager
+async def _hosted_lifespan(application):
+    runtime_task = None
+    runtime_state = None
 
-async def _shutdown_runtime(state):
-    from hosted_runtime import stop_hosted_runtime
-    if state:
-        await stop_hosted_runtime(state)
+    async def boot():
+        from hosted_runtime import start_hosted_runtime
+        return await start_hosted_runtime()
 
-@app.on_event("startup")
-async def _start_agentos_background_runtime():
-    app.state.agentos_runtime = None
-    app.state.agentos_runtime_task = asyncio.create_task(_boot_runtime())
+    runtime_task = asyncio.create_task(boot())
+    try:
+        yield
+        if runtime_task.done() and not runtime_task.cancelled():
+            try:
+                runtime_state = runtime_task.result()
+            except Exception:
+                runtime_state = None
+    finally:
+        if runtime_state is None and runtime_task.done() and not runtime_task.cancelled():
+            try:
+                runtime_state = runtime_task.result()
+            except Exception:
+                runtime_state = None
 
-@app.on_event("shutdown")
-async def _stop_agentos_background_runtime():
-    task = getattr(app.state, "agentos_runtime_task", None)
-    state = getattr(app.state, "agentos_runtime", None)
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    elif task and task.done() and state is None:
-        try:
-            state = task.result()
-        except Exception:
-            state = None
-    if state:
-        try:
-            await _shutdown_runtime(state)
-        except Exception:
-            pass
+        if runtime_state:
+            try:
+                from hosted_runtime import stop_hosted_runtime
+                await stop_hosted_runtime(runtime_state)
+            except Exception:
+                pass
+
+        if runtime_task and not runtime_task.done():
+            runtime_task.cancel()
+            try:
+                await runtime_task
+            except asyncio.CancelledError:
+                pass
+
+app.router.lifespan_context = _hosted_lifespan
 
 uvicorn.run(
     app,
