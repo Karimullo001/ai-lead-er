@@ -107,7 +107,7 @@ async def _telegram_runtime() -> None:
     )
 
     log.info("Telegram runtime: creating polling bot")
-    bot = await asyncio.to_thread(Bot, token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher()
     dp.message.middleware(AuthMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
