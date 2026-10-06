@@ -293,3 +293,15 @@ def patch_memory_handlers(s):
 add_memory()
 patch_file("core/worker.py",patch_memory_worker)
 patch_file("telegram_bot/handlers.py",patch_memory_handlers)
+
+def patch_expert_command(s):
+    if 'Command("expert")' in s: return s
+    marker='@router.message(Command("help"))'
+    block='''@router.message(Command("expert"))
+async def cmd_expert(message: Message):
+    await message.answer("🧠 *Expert mode ON*\\n\\nPolymath • Business Coach • Startup Builder • Creative • Security • Biohacker • Engineer • Psychologist • Chess Master • Profiler • Stoic • Dr. House • Crypto • Global Vibes\\n\\nSend any question or task. I will choose the relevant skills automatically.", parse_mode="Markdown")
+
+'''
+    return s.replace(marker,block+marker,1)
+
+patch_file("telegram_bot/handlers.py",patch_expert_command)
