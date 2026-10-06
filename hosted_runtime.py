@@ -39,18 +39,22 @@ async def _telegram_runtime() -> None:
         log.warning("TELEGRAM_BOT_TOKEN missing; Telegram disabled")
         return
 
+    log.info("Telegram runtime: token configured; connecting to Postgres")
     dsn = os.environ["DATABASE_URL"]
     redis_url = os.environ["REDIS_URL"]
 
     tm = TaskManager(dsn)
     await tm.connect()
+    log.info("Telegram runtime: Postgres connected")
     queue = TaskQueue(redis_url, consumer_name="api-hosted-telegram")
     await queue.connect()
+    log.info("Telegram runtime: Redis connected")
 
     tools = ToolRegistry()
     register_demo_tools(tools)
     events = EventStore(dsn=dsn)
     await events.connect()
+    log.info("Telegram runtime: EventStore connected")
     comm = CommunicationBus()
     router_model = ModelRouter()
     llm = LLMClient(router=router_model)
@@ -72,6 +76,7 @@ async def _telegram_runtime() -> None:
 
     notifier = get_notifier()
     await notifier.start()
+    log.info("Telegram runtime: notifier ready")
     STATE.update(
         tm=tm, queue=queue, router=router_model, orch=orch,
         approval=approval, notifier=notifier, redis_url=redis_url
@@ -122,10 +127,9 @@ async def _supervisor() -> None:
     worker_task = asyncio.create_task(_worker_runtime(), name="agentos-worker-embedded")
     telegram_task = None
 
-    if os.getenv("TELEGRAM_BOT_TOKEN"):
-        telegram_task = asyncio.create_task(
-            _telegram_runtime(), name="agentos-telegram-embedded"
-        )
+    telegram_task = asyncio.create_task(
+        _telegram_runtime(), name="agentos-telegram-embedded"
+    )
 
     tasks = [worker_task] + ([telegram_task] if telegram_task else [])
     results = await asyncio.gather(*tasks, return_exceptions=True)
