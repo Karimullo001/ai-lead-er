@@ -32,6 +32,7 @@ async def _telegram_runtime() -> None:
     from core.tools import Sandbox, ToolRegistry
     from demo.agents import build_demo_specs, register_demo_tools
     from telegram_bot.handlers import STATE, router
+    from telegram_bot.bot import _status_notifier_loop
     from telegram_bot.security import AuthMiddleware
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -93,7 +94,7 @@ async def _telegram_runtime() -> None:
 
         async def send(self, chat_id, text, reply_markup=None):
             if self.bot is None:
-                self.bot = await asyncio.to_thread(Bot, self.token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+                self.bot = Bot(self.token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
             try:
                 await self.bot.send_message(int(chat_id), text[:4000], reply_markup=reply_markup)
             except Exception:
@@ -104,6 +105,11 @@ async def _telegram_runtime() -> None:
     STATE.update(
         tm=tm, queue=queue, router=router_model, orch=orch,
         approval=approval, notifier=notifier, redis_url=redis_url
+    )
+    # Hosted mode must run the terminal-task notifier too. The standalone
+    # telegram bot normally starts this loop, but embedded mode bypasses bot.py.
+    status_notifier_task = asyncio.create_task(
+        _status_notifier_loop(tm, notifier), name="agentos-status-notifier"
     )
 
     log.info("Telegram runtime: creating polling bot")
@@ -123,6 +129,8 @@ async def _telegram_runtime() -> None:
     except Exception:
         log.exception("Telegram polling stopped with an error")
     finally:
+        status_notifier_task.cancel()
+        await asyncio.gather(status_notifier_task, return_exceptions=True)
         await notifier.stop()
         await bot.session.close()
         await queue.close()
