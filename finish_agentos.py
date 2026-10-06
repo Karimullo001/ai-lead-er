@@ -838,7 +838,22 @@ async def production_healthz():
         data["heartbeats"] = {}
     return data
 '''
-        ap.write_text(a, encoding="utf-8")
+        # Force-replace any legacy Telegram webhook route at runtime.
+    a += r'''
+# Final Telegram webhook route replacement: remove every previous route with
+# the same path so a legacy 501 handler cannot shadow the real handler.
+try:
+    _telegram_webhook_routes = [r for r in list(app.router.routes) if getattr(r, "path", None) == "/telegram/webhook"]
+    for _route in _telegram_webhook_routes:
+        try:
+            app.router.routes.remove(_route)
+        except ValueError:
+            pass
+    app.add_api_route("/telegram/webhook", telegram_webhook, methods=["POST"])
+except Exception:
+    pass
+'''
+    ap.write_text(a, encoding="utf-8")
 
 # 11) Final compile check after every production hardening patch.
 if not compileall.compile_dir(str(ROOT), quiet=1):
