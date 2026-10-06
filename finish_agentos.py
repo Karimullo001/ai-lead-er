@@ -283,18 +283,27 @@ async def _telegram_loop(tm, queue, router_model, orch):
 
 async def handle_telegram_webhook(payload: dict, secret_header: str | None = None):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
+    log.info("Telegram webhook request received: has_secret=%s payload_keys=%s", bool(secret_header), sorted(payload.keys()) if isinstance(payload, dict) else [])
     if not token or not secret_header:
+        log.warning("Telegram webhook rejected: missing token or secret header")
         return False
     expected = _agentos_hashlib.sha256(token.encode()).hexdigest()
     if secret_header != expected:
+        log.warning("Telegram webhook rejected: invalid secret header")
         return False
     dp = _runtime.get("dispatcher")
     bot = _runtime.get("bot")
     if not dp or not bot:
+        log.warning("Telegram webhook rejected: dispatcher/bot not ready")
         return False
-    update = _AgentOSUpdate.model_validate(payload)
-    await dp.feed_update(bot, update)
-    return True
+    try:
+        update = _AgentOSUpdate.model_validate(payload)
+        await dp.feed_update(bot, update)
+        log.info("Telegram webhook update processed")
+        return True
+    except Exception:
+        log.exception("Telegram webhook update processing failed")
+        return False
 '''
         hr.write_text(h, encoding="utf-8")
 
