@@ -1,35 +1,41 @@
 from pathlib import Path
+import re
 
 p = Path("api/main.py")
 s = p.read_text(encoding="utf-8")
 
 if "HOSTED_RUNTIME" not in s:
-    s = s.replace(
-        'STATE: Dict[str, Any] = {}',
-        'STATE: Dict[str, Any] = {}\nHOSTED_RUNTIME: Dict[str, Any] = {}'
-    )
+    marker = "STATE: Dict[str, Any] = {}"
+    if marker not in s:
+        raise SystemExit("STATE marker not found")
+    s = s.replace(marker, marker + "\nHOSTED_RUNTIME: Dict[str, Any] = {}", 1)
 
-old = '''    STATE.update(dict(tools=tools, events=events, comm=comm, approval=approval,
-                      llm=llm, factory=factory, orch=orch))
-    log.info("AgentOS ready with %d agents", len(orch.agents))
-    yield
-    STATE.clear()'''
+if "start_hosted_runtime" in s:
+    p.write_text(s, encoding="utf-8")
+    print("already patched")
+    raise SystemExit(0)
 
-new = '''    STATE.update(dict(tools=tools, events=events, comm=comm, approval=approval,
-                      llm=llm, factory=factory, orch=orch))
-    log.info("AgentOS ready with %d agents", len(orch.agents))
-    if os.getenv("EMBEDDED_RUNTIME", "true").lower() == "true":
+pattern = re.compile(
+    r'(    STATE\\.update\\(dict\\(tools=tools, events=events, comm=comm, approval=approval,\\n'
+    r'                      llm=llm, factory=factory, orch=orch\\)\\n'
+    r'    log\\.info\\("AgentOS ready with %d agents", len\\(orch\\.agents\\)\\)\\n)'
+    r'(    yield\\n    STATE\\.clear\\(\\))'
+)
+
+replacement = r'''\1    if os.getenv("EMBEDDED_RUNTIME", "true").lower() == "true":
         from hosted_runtime import start_hosted_runtime
         HOSTED_RUNTIME.update(await start_hosted_runtime())
-    yield
-    if HOSTED_RUNTIME:
-        from hosted_runtime import stop_hosted_runtime
-        await stop_hosted_runtime(HOSTED_RUNTIME)
-        HOSTED_RUNTIME.clear()
-    STATE.clear()'''
+\n\2'''
 
-if old not in s:
+if not pattern.search(s):
     raise SystemExit("lifespan block not found")
 
-p.write_text(s.replace(old, new), encoding="utf-8")
+s = pattern.sub(replacement, s, count=1)
+# Replace shutdown tail with graceful embedded-runtime shutdown.
+s = s.replace(
+    '    yield\n    STATE.clear()',
+    '    yield\n    if HOSTED_RUNTIME:\n        from hosted_runtime import stop_hosted_runtime\n        await stop_hosted_runtime(HOSTED_RUNTIME)\n        HOSTED_RUNTIME.clear()\n    STATE.clear()',
+    1,
+)
+p.write_text(s, encoding="utf-8")
 print("ok")
