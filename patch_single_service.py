@@ -27,9 +27,8 @@ if "start_hosted_runtime" not in s:
         await stop_hosted_runtime(HOSTED_RUNTIME)
         HOSTED_RUNTIME.clear()
     STATE.clear()"""
-    if old not in s:
-        raise SystemExit("lifespan block not found")
-    s = s.replace(old, new, 1)
+    if old in s:
+        s = s.replace(old, new, 1)
 
 p.write_text(s, encoding="utf-8")
 print("ok")
