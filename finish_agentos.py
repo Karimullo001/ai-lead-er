@@ -320,3 +320,9 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 '''
         ap.write_text(a, encoding="utf-8")
+
+
+# Final syntax check includes the generated hosted webhook runtime and API route.
+if not compileall.compile_dir(str(ROOT), quiet=1):
+    raise SystemExit("AgentOS final pass: final generated source compilation failed")
+print("AgentOS final pass: final generated-source compile check passed")
