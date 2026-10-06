@@ -305,3 +305,10 @@ async def cmd_expert(message: Message):
     return s.replace(marker,block+marker,1)
 
 patch_file("telegram_bot/handlers.py",patch_expert_command)
+
+def patch_expert_menu(s):
+    if 'command="expert"' in s: return s
+    needle='BotCommand(command="help", description="Help"),'
+    return s.replace(needle,needle+'\n        BotCommand(command="expert", description="Expert mode"),',1)
+
+patch_file("telegram_bot/bot.py",patch_expert_menu)
