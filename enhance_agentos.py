@@ -101,6 +101,73 @@ def notifier(s):
 '''
     return s.replace(anchor, method + anchor, 1)
 
+def bot_patch(s):
+    if "__ARTIFACTS_JSON__" not in s:
+        start = s.find("async def _status_notifier_loop")
+        end = s.find("\n\nif __name__ == '__main__':", start)
+        if end < 0:
+            end = s.find('\n\nif __name__ == "__main__":', start)
+        if start >= 0 and end >= 0:
+            fn = '''async def _status_notifier_loop(tm: TaskManager, notifier) -> None:
+    seen = set()
+    while True:
+        try:
+            async with tm.pool.acquire() as c:
+                rows = await c.fetch("SELECT * FROM tasks WHERE status IN ('COMPLETED','FAILED','WAITING_APPROVAL') ORDER BY updated_at DESC LIMIT 50")
+            for r in rows:
+                key = str(r["task_id"]) + ":" + str(r["status"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                chat_id = r.get("chat_id")
+                if not chat_id:
+                    continue
+                short = str(r["task_id"])[:8]
+                if r["status"] == "FAILED":
+                    await notifier.send(chat_id, "❌ Task failed " + short + "\\n\\nError: " + str(r.get("error") or "unknown")[:2500])
+                    continue
+                if r["status"] == "WAITING_APPROVAL":
+                    await notifier.send(chat_id, "🔐 Task " + short + " is waiting for approval.")
+                    continue
+                raw = r.get("result") or ""
+                artifact_json = ""
+                if "__ARTIFACTS_JSON__" in raw:
+                    raw, artifact_json = raw.split("__ARTIFACTS_JSON__", 1)
+                elapsed = (r.get("completed_at") or 0) - (r.get("started_at") or 0)
+                await notifier.send(chat_id, "✅ Task completed " + short + "\\n⏱ " + str(int(elapsed)) + "s\\n\\n" + raw.strip()[:3000])
+                try:
+                    artifacts = json.loads(artifact_json.strip()) if artifact_json.strip() else []
+                except Exception:
+                    artifacts = []
+                for artifact in artifacts:
+                    if isinstance(artifact, dict):
+                        await notifier.send_artifact(chat_id, artifact)
+        except Exception as exc:
+            log.debug("notifier loop: %s", exc)
+        await asyncio.sleep(5)
+'''
+            s = s[:start] + fn + s[end:]
+    if "BotCommand" not in s:
+        s = s.replace("from aiogram import Bot, Dispatcher", "from aiogram import Bot, Dispatcher\nfrom aiogram.types import BotCommand", 1)
+    if "set_my_commands" not in s:
+        menu = '''    await bot.set_my_commands([
+        BotCommand(command="start", description="Open AgentOS"),
+        BotCommand(command="task", description="Create a task"),
+        BotCommand(command="tasks", description="My tasks"),
+        BotCommand(command="status", description="System status"),
+        BotCommand(command="agents", description="AI agents"),
+        BotCommand(command="pause", description="Pause task"),
+        BotCommand(command="resume", description="Resume task"),
+        BotCommand(command="cancel", description="Cancel task"),
+        BotCommand(command="retry", description="Retry task"),
+        BotCommand(command="help", description="Help"),
+    ])
+'''
+        s = s.replace("    dp = Dispatcher()", "    dp = Dispatcher()\n" + menu, 1)
+    return s
+
+patch_file("telegram_bot/bot.py", bot_patch)
+
 patch_file("core/worker.py", worker)
 patch_file("telegram_bot/notifier.py", notifier)
 print("enhancement patch complete")
