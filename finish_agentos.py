@@ -307,12 +307,20 @@ async def handle_telegram_webhook(payload: dict, secret_header: str | None = Non
 '''
         hr.write_text(h, encoding="utf-8")
 
-# Install the webhook HTTP endpoint after hosted_runtime has been generated.
+# Install/replace the webhook HTTP endpoint after hosted_runtime has been generated.
+# The bootstrap/upgrade pass may already have installed a legacy handler that
+# returns HTTP 501 when telegram_bot.bot_webhook is absent. Remove that route
+# before adding the real hosted-runtime handler so FastAPI cannot shadow it.
 ap = ROOT / "api/main.py"
 if ap.exists():
     a = ap.read_text(encoding="utf-8")
-    if "/telegram/webhook" not in a:
-        a += r'''
+    a = re.sub(
+        r'\n@app\.post\("/telegram/webhook"\)\s*\nasync def telegram_webhook\(request: Request\):.*?(?=\n@app\.|\Z)',
+        "",
+        a,
+        flags=re.S,
+    )
+    webhook_endpoint = r'''
 # Telegram webhook endpoint. Authentication is performed by hosted_runtime
 # using a token-derived secret header; invalid requests are rejected.
 from fastapi import Request
@@ -328,7 +336,8 @@ async def telegram_webhook(request: Request):
         return JSONResponse({"ok": False}, status_code=403)
     return {"ok": True}
 '''
-        ap.write_text(a, encoding="utf-8")
+    a += webhook_endpoint
+    ap.write_text(a, encoding="utf-8")
 
 
 # Final syntax check includes the generated hosted webhook runtime and API route.
