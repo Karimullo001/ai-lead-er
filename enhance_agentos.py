@@ -363,10 +363,7 @@ async def _media_task(message: Message, kind: str) -> None:
             f"Caption/request: {caption or '(no caption; infer the useful task)'}"
         )
         if analysis:
-            prompt += "
-
-Pre-analysis from multimodal ingestion:
-" + analysis[:12000]
+            prompt += "\\n\\nPre-analysis from multimodal ingestion:\\n" + analysis[:12000]
         await _create_task_and_ack(message, prompt)
     except Exception as exc:
         log.exception("media ingestion failed")
