@@ -247,3 +247,49 @@ def patch_expert_prompts(s):
 
 expert_layer()
 patch_file("core/prompts.py", patch_expert_prompts)
+
+def add_memory():
+    p=Path("core/conversation_memory.py")
+    if not p.exists():
+        p.write_text('''import json,time
+class ConversationMemory:
+    def __init__(self,pool): self.pool=pool
+    async def ensure(self):
+        async with self.pool.acquire() as c:
+            await c.execute("""CREATE TABLE IF NOT EXISTS conversation_messages (id BIGSERIAL PRIMARY KEY,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,created_at DOUBLE PRECISION NOT NULL); CREATE INDEX IF NOT EXISTS conv_idx ON conversation_messages(user_id,chat_id,created_at);""")
+    async def append(self,user_id,chat_id,role,content):
+        async with self.pool.acquire() as c:
+            await c.execute("INSERT INTO conversation_messages(user_id,chat_id,role,content,created_at) VALUES($1,$2,$3,$4,$5)",str(user_id),str(chat_id),role,str(content),time.time())
+    async def render(self,user_id,chat_id,limit=20):
+        async with self.pool.acquire() as c:
+            rows=await c.fetch("SELECT role,content FROM conversation_messages WHERE user_id=$1 AND chat_id=$2 ORDER BY created_at DESC LIMIT $3",str(user_id),str(chat_id),limit)
+        return "\\n".join("[{}] {}".format(r["role"],str(r["content"])[:1200]) for r in reversed(rows))
+''',encoding="utf-8")
+def patch_memory_worker(s):
+    if "conversation_memory" in s: return s
+    s=s.replace("from .health import Heartbeat","from .health import Heartbeat\nfrom .conversation_memory import ConversationMemory",1)
+    s=s.replace("        self.hb: Optional[Heartbeat] = None","        self.hb: Optional[Heartbeat] = None\n        self.conv=None",1)
+    s=s.replace("        await self.tm.connect()","        await self.tm.connect()\n        self.conv=ConversationMemory(self.tm.pool)\n        await self.conv.ensure()",1)
+    old='''        task = Task(id=task_id, description=row["description"],
+                    domain=row.get("domain") or "general")'''
+    new='''        description=row["description"]
+        if self.conv and row.get("chat_id") and row.get("user_id"):
+            try:
+                h=await self.conv.render(row["user_id"],row["chat_id"])
+                if h: description="Past conversation:\\n"+h+"\\n\\nTask:\\n"+description
+            except Exception: pass
+        task = Task(id=task_id, description=description,
+                    domain=row.get("domain") or "general")'''
+    return s.replace(old,new,1)
+def patch_memory_handlers(s):
+    if "conversation_memory" in s: return s
+    s=s.replace("from .notifier import Notifier","from .notifier import Notifier\nfrom core.conversation_memory import ConversationMemory",1)
+    marker='    await tm.audit(str(user_id), "task.created", {"task_id": tid})'
+    repl=marker+'''\n    try:
+        cm=ConversationMemory(tm.pool); await cm.ensure()
+        await cm.append(user_id,chat_id,"user",text)
+    except Exception: pass'''
+    return s.replace(marker,repl,1)
+add_memory()
+patch_file("core/worker.py",patch_memory_worker)
+patch_file("telegram_bot/handlers.py",patch_memory_handlers)
