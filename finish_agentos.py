@@ -952,3 +952,11 @@ uvicorn.run(
     log_level=os.getenv("LOG_LEVEL", "info"),
 )
 ''', encoding="utf-8")
+
+# Ensure the FIFO worker has the UUID dependency used by its execution owner.
+worker_path = ROOT / "core/worker.py"
+if worker_path.exists():
+    ws = worker_path.read_text(encoding="utf-8")
+    if "import uuid" not in ws:
+        ws = ws.replace("import asyncio", "import asyncio\nimport uuid", 1) if "import asyncio" in ws else "import uuid\n" + ws
+        worker_path.write_text(ws, encoding="utf-8")
