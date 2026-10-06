@@ -344,7 +344,10 @@ async def _media_task(message: Message, kind: str) -> None:
             await message.answer("⚠️ I couldn't read that media.")
             return
         tg = await bot.get_file(tg_file_id)
-        path = tempfile.mktemp(prefix="agentos_media_", suffix=suffix)
+        # Create the destination atomically to avoid mktemp race conditions.
+        tmp = tempfile.NamedTemporaryFile(prefix="agentos_media_", suffix=suffix, delete=False)
+        path = tmp.name
+        tmp.close()
         await bot.download(tg, destination=path)
 
         analysis = ""
