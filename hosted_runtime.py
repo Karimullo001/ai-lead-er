@@ -93,7 +93,7 @@ async def _telegram_runtime() -> None:
 
         async def send(self, chat_id, text, reply_markup=None):
             if self.bot is None:
-                self.bot = Bot(self.token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+                self.bot = await asyncio.to_thread(Bot, self.token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
             try:
                 await self.bot.send_message(int(chat_id), text[:4000], reply_markup=reply_markup)
             except Exception:
@@ -107,7 +107,7 @@ async def _telegram_runtime() -> None:
     )
 
     log.info("Telegram runtime: creating polling bot")
-    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+    bot = await asyncio.to_thread(Bot, token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher()
     dp.message.middleware(AuthMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
