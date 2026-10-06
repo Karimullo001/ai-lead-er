@@ -938,6 +938,7 @@ async def _hosted_lifespan(application):
     runtime_state = None
 
     async def boot():
+        await asyncio.sleep(1)
         from hosted_runtime import start_hosted_runtime
         return await start_hosted_runtime()
 
