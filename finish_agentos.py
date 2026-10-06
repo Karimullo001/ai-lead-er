@@ -826,3 +826,55 @@ async def production_healthz():
 if not compileall.compile_dir(str(ROOT), quiet=1):
     raise SystemExit("AgentOS production hardening pass failed Python compilation")
 print("AgentOS production hardening pass 2: FIFO + memory + artifacts + video + webhook ownership + memory caps OK")
+
+
+# 12) Native provider tool-call preservation
+# LiteLLM providers must preserve native tool calls; otherwise the autonomous
+# execution layer receives an empty tool_calls list and silently degrades to text.
+lp = ROOT / "core/providers/_litellm_base.py"
+if lp.exists():
+    x = lp.read_text(encoding="utf-8")
+    old = '''        msg = resp.choices[0].message
+        text = msg.content or ""
+        usage = getattr(resp, "usage", None)
+'''
+    new = '''        msg = resp.choices[0].message
+        text = msg.content or ""
+        native_tool_calls = []
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            fn = getattr(tc, "function", None)
+            native_tool_calls.append({
+                "id": getattr(tc, "id", None),
+                "name": getattr(fn, "name", None),
+                "arguments": getattr(fn, "arguments", None),
+            })
+        usage = getattr(resp, "usage", None)
+'''
+    if old in x and "native_tool_calls" not in x:
+        x = x.replace(old,new,1)
+        x = x.replace('raw={"finish_reason": getattr(resp.choices[0], "finish_reason", None)},',
+                      'raw={"finish_reason": getattr(resp.choices[0], "finish_reason", None), "tool_calls": native_tool_calls},',1)
+        lp.write_text(x,encoding="utf-8")
+
+llp = ROOT / "core/llm.py"
+if llp.exists():
+    x = llp.read_text(encoding="utf-8")
+    old = '''        # Router returns text only; tool_calls are provider-specific. For the
+        # kernel, the planner path uses complete_json, so this is a fallback.
+        return {"content": comp.text, "tool_calls": []}
+'''
+    new = '''        raw = comp.raw or {}
+        return {
+            "content": comp.text,
+            "tool_calls": raw.get("tool_calls") or [],
+            "provider": comp.provider,
+            "model": comp.model,
+        }
+'''
+    if old in x:
+        x=x.replace(old,new,1)
+        llp.write_text(x,encoding="utf-8")
+
+if not compileall.compile_dir(str(ROOT), quiet=1):
+    raise SystemExit("Native tool-call preservation patch failed Python compilation")
+print("AgentOS native tool calls preserved")
