@@ -1859,6 +1859,11 @@ async def nl_handler(message: Message):
     text = (message.text or "").strip()
     if not text:
         return
+    # Simple greetings should be answered directly, not scheduled as tasks.
+    greeting = text.lower().strip(" !?.")
+    if greeting in {"hi", "hello", "hey", "salom", "assalomu alaykum", "yo"}:
+        await message.answer("👋 Salom! Men AgentOSman. Nima qilamiz?")
+        return
     await _create_task_and_ack(message, text)
 
 
@@ -1913,11 +1918,9 @@ async def _create_task_and_ack(message: Message, text: str):
     await tm.audit(str(user_id), "task.created", {"task_id": tid})
     short = tid[:8]
     sent = await message.answer(
-        "🤖 AgentOS is working...\\n\\n"
+        "🤖 AgentOS\\n\\n"
         "░░░░░░░░░░░░░░░░░░░░ 0%\\n\\n"
-        "⏳ Queued\\n"
-        + "ID: " + short + "\\n\\n"
-        + "Live progress will update here.")
+        "⏳ Ishlayapman...")
     asyncio.create_task(_task_progress_loop(tid, chat_id, sent.message_id),
                         name="task-progress-" + short)
 
