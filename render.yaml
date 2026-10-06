@@ -3,7 +3,7 @@ services:
     name: agentos-api-v2
     runtime: python
     plan: free
-    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
+    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && python patch_single_service.py && pip install -e .
     startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
@@ -15,6 +15,8 @@ services:
           type: keyvalue
           name: agentos-redis
           property: connectionString
+      - key: EMBEDDED_RUNTIME
+        value: "true"
       - key: AGENTOS_API_TOKEN
         sync: false
       - key: OPENAI_API_KEY
@@ -32,68 +34,6 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_ALLOWED_USER_IDS
-        sync: false
-
-  - type: worker
-    name: agentos-worker
-    runtime: python
-    plan: free
-    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
-    startCommand: python -m core.worker
-    envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: agentos-db
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: agentos-redis
-          property: connectionString
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: DEEPSEEK_API_KEY
-        sync: false
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: GROQ_API_KEY
-        sync: false
-      - key: OPENROUTER_API_KEY
-        sync: false
-      - key: XAI_API_KEY
-        sync: false
-
-  - type: worker
-    name: agentos-telegram
-    runtime: python
-    plan: free
-    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
-    startCommand: python -m telegram_bot.bot
-    envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: agentos-db
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: agentos-redis
-          property: connectionString
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_ALLOWED_USER_IDS
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: DEEPSEEK_API_KEY
-        sync: false
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: GROQ_API_KEY
-        sync: false
-      - key: OPENROUTER_API_KEY
-        sync: false
-      - key: XAI_API_KEY
         sync: false
 
   - type: keyvalue
