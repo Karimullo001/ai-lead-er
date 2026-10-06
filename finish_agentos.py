@@ -914,14 +914,15 @@ print("AgentOS native tool calls preserved")
 
 
 
-# Render entrypoint: keep exactly one embedded runtime. api.main has its
-# lifespan runtime disabled here, while this entrypoint starts it once.
+
+# Render entrypoint: boot the hosted runtime in the background so Uvicorn can
+# bind its port immediately even if database/model initialization is slow.
 hs = ROOT / "hosted_start.py"
 hs.write_text(r'''"""Single-process Render entrypoint for AgentOS."""
 from __future__ import annotations
 
+import asyncio
 import os
-from contextlib import asynccontextmanager
 
 import uvicorn
 
@@ -929,21 +930,40 @@ os.environ["EMBEDDED_RUNTIME"] = "false"
 
 from api.main import app
 
-_original_lifespan = app.router.lifespan_context
+async def _boot_runtime():
+    from hosted_runtime import start_hosted_runtime
+    return await start_hosted_runtime()
 
-@asynccontextmanager
-async def _hosted_lifespan(application):
-    runtime = None
-    async with _original_lifespan(application):
-        from hosted_runtime import start_hosted_runtime, stop_hosted_runtime
-        runtime = await start_hosted_runtime()
+async def _shutdown_runtime(state):
+    from hosted_runtime import stop_hosted_runtime
+    if state:
+        await stop_hosted_runtime(state)
+
+@app.on_event("startup")
+async def _start_agentos_background_runtime():
+    app.state.agentos_runtime = None
+    app.state.agentos_runtime_task = asyncio.create_task(_boot_runtime())
+
+@app.on_event("shutdown")
+async def _stop_agentos_background_runtime():
+    task = getattr(app.state, "agentos_runtime_task", None)
+    state = getattr(app.state, "agentos_runtime", None)
+    if task and not task.done():
+        task.cancel()
         try:
-            yield
-        finally:
-            if runtime:
-                await stop_hosted_runtime(runtime)
-
-app.router.lifespan_context = _hosted_lifespan
+            await task
+        except asyncio.CancelledError:
+            pass
+    elif task and task.done() and state is None:
+        try:
+            state = task.result()
+        except Exception:
+            state = None
+    if state:
+        try:
+            await _shutdown_runtime(state)
+        except Exception:
+            pass
 
 uvicorn.run(
     app,
@@ -952,11 +972,3 @@ uvicorn.run(
     log_level=os.getenv("LOG_LEVEL", "info"),
 )
 ''', encoding="utf-8")
-
-# Ensure the FIFO worker has the UUID dependency used by its execution owner.
-worker_path = ROOT / "core/worker.py"
-if worker_path.exists():
-    ws = worker_path.read_text(encoding="utf-8")
-    if "import uuid" not in ws:
-        ws = ws.replace("import asyncio", "import asyncio\nimport uuid", 1) if "import asyncio" in ws else "import uuid\n" + ws
-        worker_path.write_text(ws, encoding="utf-8")
