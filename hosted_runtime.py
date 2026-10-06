@@ -1,44 +1,47 @@
+"""Embedded AgentOS runtime for Free Render.
+
+The API must bind its port even if worker/Telegram initialization is slow.
+All heavy imports and connections therefore happen in background tasks.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-from typing import Any, Dict
-
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-
-from core.model_router import ModelRouter
-from core.worker import Worker
-from core.task_manager import TaskManager
-from core.queue import TaskQueue
-from core.orchestrator import Orchestrator
-from demo.agents import build_demo_specs, register_demo_tools
-from core.approval import ApprovalGate
-from core.comm_bus import CommunicationBus
-from core.events import EventStore
-from core.factory import AgentFactory
-from core.reliability import ReliabilityEngine
-from core.tools import Sandbox, ToolRegistry
-from core.llm import LLMClient
-from telegram_bot.handlers import router
-from telegram_bot.security import AuthMiddleware
-from telegram_bot.notifier import get_notifier
+from typing import Any
 
 log = logging.getLogger("agentos.hosted")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
-async def _telegram_runtime():
+async def _telegram_runtime() -> None:
+    from aiogram import Bot, Dispatcher
+    from aiogram.client.default import DefaultBotProperties
+    from aiogram.enums import ParseMode
+    from core.approval import ApprovalGate
+    from core.comm_bus import CommunicationBus
+    from core.events import EventStore
+    from core.factory import AgentFactory
+    from core.llm import LLMClient
+    from core.model_router import ModelRouter
+    from core.orchestrator import Orchestrator
+    from core.queue import TaskQueue
+    from core.reliability import ReliabilityEngine
+    from core.task_manager import TaskManager
+    from core.tools import Sandbox, ToolRegistry
+    from demo.agents import build_demo_specs, register_demo_tools
+    from telegram_bot.handlers import STATE, router
+    from telegram_bot.notifier import get_notifier
+    from telegram_bot.security import AuthMiddleware
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        log.warning("TELEGRAM_BOT_TOKEN not configured; Telegram integration disabled")
-        await asyncio.Event().wait()
+        log.warning("TELEGRAM_BOT_TOKEN missing; Telegram disabled")
         return
 
     dsn = os.environ["DATABASE_URL"]
     redis_url = os.environ["REDIS_URL"]
+
     tm = TaskManager(dsn)
     await tm.connect()
     queue = TaskQueue(redis_url, consumer_name="api-hosted-telegram")
@@ -55,15 +58,18 @@ async def _telegram_runtime():
         auto_approve_in_dev=os.getenv("AUTO_APPROVE", "false").lower() == "true"
     )
     factory = AgentFactory(
-        llm=llm, tools=tools, event_store=events, comm_bus=comm,
-        reliability=ReliabilityEngine(), approval_gate=approval,
+        llm=llm,
+        tools=tools,
+        event_store=events,
+        comm_bus=comm,
+        reliability=ReliabilityEngine(),
+        approval_gate=approval,
         sandbox=Sandbox(prefer_docker=False),
     )
     orch = Orchestrator(events, comm)
     for spec in build_demo_specs():
         orch.register_agent(factory.build(spec))
 
-    from telegram_bot.handlers import STATE
     notifier = get_notifier()
     await notifier.start()
     STATE.update(
@@ -91,51 +97,67 @@ async def _telegram_runtime():
         await bot.session.close()
         await queue.close()
         await tm.close()
+        log.info("Telegram runtime stopped")
 
 
-async def start_hosted_runtime() -> Dict[str, Any]:
+async def _worker_runtime() -> None:
+    from core.worker import Worker
+
     worker = Worker(name="api-hosted-worker")
     await worker.setup()
-    worker_task = asyncio.create_task(worker.loop(), name="agentos-worker-embedded")
+    log.info("Embedded worker initialized")
+    try:
+        await worker.loop()
+    except asyncio.CancelledError:
+        raise
+    finally:
+        try:
+            await worker.shutdown()
+        except Exception:
+            log.exception("Embedded worker shutdown failed")
 
+
+async def _supervisor() -> None:
+    log.info("Hosted runtime supervisor starting")
+    worker_task = asyncio.create_task(_worker_runtime(), name="agentos-worker-embedded")
     telegram_task = None
+
     if os.getenv("TELEGRAM_BOT_TOKEN"):
         telegram_task = asyncio.create_task(
             _telegram_runtime(), name="agentos-telegram-embedded"
         )
 
-        def _report_task_result(task: asyncio.Task) -> None:
-            if task.cancelled():
-                log.info("Embedded Telegram task cancelled")
-                return
-            exc = task.exception()
-            if exc:
-                log.exception("Embedded Telegram task crashed", exc_info=exc)
-            else:
-                log.warning("Embedded Telegram task exited unexpectedly")
+    tasks = [worker_task] + ([telegram_task] if telegram_task else [])
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        telegram_task.add_done_callback(_report_task_result)
+    for name, result in zip(("worker", "telegram"), results):
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            log.error("Hosted %s task crashed: %r", name, result)
+        else:
+            log.warning("Hosted %s task exited", name)
+
+
+async def start_hosted_runtime() -> dict[str, Any]:
+    supervisor = asyncio.create_task(_supervisor(), name="agentos-hosted-supervisor")
+    supervisor.add_done_callback(_report_supervisor)
+    log.info("AgentOS hosted supervisor launched")
+    return {"supervisor_task": supervisor}
+
+
+def _report_supervisor(task: asyncio.Task) -> None:
+    if task.cancelled():
+        log.info("Hosted runtime supervisor cancelled")
+        return
+    exc = task.exception()
+    if exc:
+        log.error("Hosted runtime supervisor crashed", exc_info=exc)
     else:
-        log.warning("TELEGRAM_BOT_TOKEN is missing; Telegram task not started")
-
-    log.info("AgentOS single-service runtime started: worker=%s telegram=%s",
-             True, bool(telegram_task))
-    return {"worker": worker, "worker_task": worker_task, "telegram_task": telegram_task}
+        log.warning("Hosted runtime supervisor exited")
 
 
-async def stop_hosted_runtime(runtime: Dict[str, Any]) -> None:
-    worker = runtime.get("worker")
-    if worker:
-        worker.stop.set()
-
-    for key in ("telegram_task", "worker_task"):
-        task = runtime.get(key)
-        if task:
-            task.cancel()
-
-    tasks = [runtime[k] for k in ("telegram_task", "worker_task") if runtime.get(k)]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    if worker:
-        await worker.shutdown()
+async def stop_hosted_runtime(runtime: dict[str, Any]) -> None:
+    task = runtime.get("supervisor_task")
+    if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    log.info("Hosted runtime stopped")
