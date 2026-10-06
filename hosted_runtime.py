@@ -118,4 +118,4 @@ async def stop_hosted_runtime(runtime: Dict[str, Any]) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     if worker:
-        await worker.close()
+        await worker.shutdown()
