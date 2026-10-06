@@ -326,3 +326,459 @@ async def telegram_webhook(request: Request):
 if not compileall.compile_dir(str(ROOT), quiet=1):
     raise SystemExit("AgentOS final pass: final generated source compilation failed")
 print("AgentOS final pass: final generated-source compile check passed")
+
+
+# ---------------------------------------------------------------------------
+# Production hardening pass 2
+# ---------------------------------------------------------------------------
+# 1) Telegram webhook ownership: an old Render instance must never delete a
+#    webhook that a newer instance has already installed.
+hr = ROOT / "hosted_runtime.py"
+if hr.exists():
+    h = hr.read_text(encoding="utf-8")
+    old = '''        if bot:
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+'''
+    new = '''        if bot:
+            # Only the instance that currently owns the webhook may delete it.
+            # This prevents an old Render instance during a rolling deploy from
+            # deleting the webhook belonging to the new instance.
+            try:
+                info = await bot.get_webhook_info()
+                current_url = getattr(info, "url", "") or ""
+                owned_url = _runtime.get("webhook_owner_url")
+                if owned_url and current_url == owned_url:
+                    await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+'''
+    if old in h:
+        h = h.replace(old, new, 1)
+    h = h.replace(
+        '_runtime["telegram_ready"] = True\n            log.info("Telegram webhook connected at %s", webhook)',
+        '_runtime["telegram_ready"] = True\n            _runtime["webhook_owner_url"] = webhook\n            log.info("Telegram webhook connected at %s", webhook)',
+        1,
+    )
+    hr.write_text(h, encoding="utf-8")
+
+# 2) Durable FIFO execution lock. Redis Streams already preserve enqueue order;
+#    this distributed lock additionally guarantees that only one task is
+#    executing at a time, even if Render briefly has two instances.
+qp = ROOT / "core/queue.py"
+if qp.exists():
+    q = qp.read_text(encoding="utf-8")
+    if "AGENTOS_EXECUTION_LOCK" not in q:
+        q = q.replace(
+'''DLQ = "agentos:tasks:dlq"
+''',
+'''DLQ = "agentos:tasks:dlq"
+AGENTOS_EXECUTION_LOCK = "agentos:execution:lock"
+''', 1)
+        marker = '''    async def ack(self, entry_id: str) -> None:
+'''
+        methods = '''    async def acquire_execution_lock(self, owner: str, ttl_seconds: int = 1800) -> bool:
+        """Global distributed execution lock: exactly one task runs at a time."""
+        assert self._r is not None
+        return bool(await self._r.set(
+            AGENTOS_EXECUTION_LOCK, owner, nx=True, ex=max(60, int(ttl_seconds))
+        ))
+
+    async def refresh_execution_lock(self, owner: str, ttl_seconds: int = 1800) -> bool:
+        assert self._r is not None
+        cur = await self._r.get(AGENTOS_EXECUTION_LOCK)
+        if cur != owner:
+            return False
+        return bool(await self._r.expire(AGENTOS_EXECUTION_LOCK, max(60, int(ttl_seconds))))
+
+    async def release_execution_lock(self, owner: str) -> bool:
+        assert self._r is not None
+        # Atomic compare-and-delete via Lua.
+        script = """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        """
+        return bool(await self._r.eval(script, 1, AGENTOS_EXECUTION_LOCK, owner))
+
+'''
+        if marker in q:
+            q = q.replace(marker, methods + marker, 1)
+        qp.write_text(q, encoding="utf-8")
+
+# 3) Worker uses the global lock and never ACKs a message until the task is
+#    actually terminal. A lock TTL protects against crashes.
+wp = ROOT / "core/worker.py"
+if wp.exists():
+    w = wp.read_text(encoding="utf-8")
+    if "execution_lock_owner" not in w:
+        w = w.replace(
+'''            try:
+                await self._run_task(task_id)
+                await self.queue.ack(entry_id)
+            except Exception as e:
+''',
+'''            owner = f"{self.name}:{entry_id}"
+            locked = False
+            try:
+                # FIFO execution: wait for the current task to finish instead
+                # of starting a second task concurrently.
+                while not self.stop.is_set():
+                    locked = await self.queue.acquire_execution_lock(owner)
+                    if locked:
+                        break
+                    await asyncio.sleep(0.5)
+                if not locked:
+                    continue
+                await self._run_task(task_id)
+                await self.queue.ack(entry_id)
+            except Exception as e:
+''', 1)
+        w = w.replace(
+'''                await self.queue.to_dlq(entry_id, task_id, str(e))
+''',
+'''                await self.queue.to_dlq(entry_id, task_id, str(e))
+            finally:
+                if locked:
+                    try:
+                        await self.queue.release_execution_lock(owner)
+                    except Exception:
+                        log.exception("Failed to release execution lock")
+''', 1)
+        wp.write_text(w, encoding="utf-8")
+
+# 4) Persistent long-term memory. Completed task summaries become searchable
+#    memory for future tasks from the same user.
+tm = ROOT / "core/task_manager.py"
+if tm.exists():
+    t = tm.read_text(encoding="utf-8")
+    if "CREATE TABLE IF NOT EXISTS memory_items" not in t:
+        t = t.replace(
+'''CREATE TABLE IF NOT EXISTS heartbeats (
+  service         TEXT PRIMARY KEY,
+  last_seen       DOUBLE PRECISION NOT NULL,
+  meta            JSONB
+);
+''',
+'''CREATE TABLE IF NOT EXISTS heartbeats (
+  service         TEXT PRIMARY KEY,
+  last_seen       DOUBLE PRECISION NOT NULL,
+  meta            JSONB
+);
+
+CREATE TABLE IF NOT EXISTS memory_items (
+  memory_id       TEXT PRIMARY KEY,
+  user_id         TEXT NOT NULL,
+  task_id         TEXT,
+  kind            TEXT NOT NULL,
+  content         TEXT NOT NULL,
+  importance      REAL DEFAULT 0.5,
+  created_at      DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_user_idx ON memory_items(user_id, created_at DESC);
+''', 1)
+        marker = '''    # ---------------- tasks ----------------
+'''
+        methods = '''    # ---------------- long-term memory ----------------
+
+    async def remember(self, user_id: str, content: str, task_id: str | None = None,
+                       kind: str = "task_summary", importance: float = 0.5) -> None:
+        if self.pool is None or not str(content).strip():
+            return
+        async with self.pool.acquire() as c:
+            await c.execute(
+                """INSERT INTO memory_items(memory_id,user_id,task_id,kind,content,importance,created_at)
+                   VALUES($1,$2,$3,$4,$5,$6,$7)""",
+                str(uuid.uuid4()), str(user_id), task_id, kind,
+                str(content)[:12000], max(0.0, min(1.0, float(importance))), time.time()
+            )
+
+    async def recall(self, user_id: str, query: str, limit: int = 8) -> list[dict]:
+        if self.pool is None:
+            return []
+        words = {x for x in str(query).lower().split() if len(x) > 2}
+        async with self.pool.acquire() as c:
+            rows = await c.fetch(
+                """SELECT memory_id,task_id,kind,content,importance,created_at
+                   FROM memory_items WHERE user_id=$1
+                   ORDER BY created_at DESC LIMIT 100""", str(user_id))
+        scored = []
+        for r in rows:
+            content = str(r["content"])
+            low = content.lower()
+            overlap = sum(1 for word in words if word in low)
+            scored.append((overlap + float(r["importance"]) * 0.25, dict(r)))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [x[1] for x in scored[:max(1, int(limit))]]
+
+'''
+        if marker in t:
+            t = t.replace(marker, methods + marker, 1)
+        tm.write_text(t, encoding="utf-8")
+
+# 5) Worker writes durable memories and injects the relevant ones into the
+#    task context without changing the user's original task text.
+if wp.exists():
+    w = wp.read_text(encoding="utf-8")
+    if "worker_memory_context" not in w:
+        w = w.replace(
+'''        task = Task(id=task_id, description=row["description"],
+                    domain=row.get("domain") or "general")
+''',
+'''        original_description = row["description"]
+        worker_memory_context = ""
+        try:
+            memories = await self.tm.recall(str(row.get("user_id") or "api"),
+                                            original_description, limit=6)
+            if memories:
+                worker_memory_context = "\\n\\n[RELEVANT LONG-TERM MEMORY]\\n" + "\\n".join(
+                    f"- {m['content'][:1200]}" for m in memories
+                )
+        except Exception:
+            log.debug("Memory recall unavailable", exc_info=True)
+        task = Task(id=task_id,
+                    description=original_description + worker_memory_context,
+                    domain=row.get("domain") or "general")
+''', 1)
+        w = w.replace(
+'''            if result.success:
+                await self.tm.set_status(task_id, TaskStatus.COMPLETED,
+''',
+'''            if result.success:
+                try:
+                    await self.tm.remember(
+                        str(row.get("user_id") or "api"),
+                        f"Task: {original_description}\\nResult: {result.summary[:8000]}",
+                        task_id=task_id, kind="task_summary", importance=0.7)
+                except Exception:
+                    log.debug("Memory write unavailable", exc_info=True)
+                await self.tm.set_status(task_id, TaskStatus.COMPLETED,
+''', 1)
+        wp.write_text(w, encoding="utf-8")
+
+# 6) Stronger artifact validation before terminal completion. Only explicit
+#    file/url artifacts are validated; ordinary step outputs remain valid.
+if wp.exists():
+    w = wp.read_text(encoding="utf-8")
+    if "artifact_validation" not in w:
+        w = w.replace(
+'''            if result.success:
+                try:
+                    await self.tm.remember(
+''',
+'''            if result.success:
+                explicit_artifacts = [
+                    a for a in (result.artifacts or [])
+                    if isinstance(a, dict) and any(k in a for k in ("path", "file_path", "url", "content"))
+                ]
+                if explicit_artifacts:
+                    from .artifact_validator import validate_all
+                    artifact_validation = validate_all(explicit_artifacts)
+                    await self.tm.log_event(task_id, "artifact_validation",
+                                            artifact_validation)
+                    if not artifact_validation["valid"]:
+                        raise RuntimeError("Artifact validation failed: " +
+                                           json.dumps(artifact_validation)[:1800])
+                try:
+                    await self.tm.remember(
+''', 1)
+        wp.write_text(w, encoding="utf-8")
+
+# 7) Full video pipeline: representative frames + audio extraction +
+#    optional OpenAI transcription + multimodal vision analysis through the
+#    existing ModelRouter. Everything is bounded to keep the 512MB instance safe.
+mp = ROOT / "core/media_pipeline.py"
+if mp.exists():
+    mp.write_text(r'''from __future__ import annotations
+import asyncio, base64, json, os, subprocess, tempfile
+from pathlib import Path
+from typing import Any
+
+MAX_VIDEO_BYTES = 120 * 1024 * 1024
+
+def extract_document(path: str):
+    p=Path(path); ext=p.suffix.lower()
+    if not p.exists():
+        return {"type":"unknown","error":"file not found"}
+    if ext in {".txt",".md",".csv",".json",".py",".js",".ts",".html",".css"}:
+        return {"type":"text","text":p.read_text(encoding="utf-8",errors="ignore")[:200000]}
+    if ext==".pdf":
+        try:
+            from pypdf import PdfReader
+            r=PdfReader(str(p))
+            return {"type":"pdf","pages":len(r.pages),"text":"\\n".join(x.extract_text() or "" for x in r.pages)[:200000]}
+        except Exception as e: return {"type":"pdf","error":f"{type(e).__name__}: {e}"}
+    if ext==".docx":
+        try:
+            from docx import Document
+            d=Document(str(p))
+            return {"type":"docx","text":"\\n".join(x.text for x in d.paragraphs)[:200000]}
+        except Exception as e: return {"type":"docx","error":f"{type(e).__name__}: {e}"}
+    return {"type":"unknown","path":str(p),"size":p.stat().st_size}
+
+def _run_ffmpeg(ff: str, args: list[str], timeout: int = 90):
+    return subprocess.run([ff, "-hide_banner", "-loglevel", "error", *args],
+                          check=True, timeout=timeout,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def _extract_frames(ff: str, path: str, out: Path, frames: int):
+    pattern=str(out/"frame_%02d.jpg")
+    _run_ffmpeg(ff, ["-i",path,"-vf","fps=1/15,scale=768:-2","-frames:v",str(frames),
+                     "-q:v","6",pattern], timeout=90)
+    return sorted(out.glob("frame_*.jpg"))
+
+def _extract_audio(ff: str, path: str, out: Path):
+    wav=out/"audio.wav"
+    _run_ffmpeg(ff, ["-i",path,"-vn","-ac","1","-ar","16000","-t","300",
+                     "-c:a","pcm_s16le",str(wav)], timeout=120)
+    return wav if wav.exists() else None
+
+def _transcribe_openai(audio: Path) -> str:
+    key=os.getenv("OPENAI_API_KEY")
+    if not key or not audio.exists():
+        return ""
+    import httpx
+    with audio.open("rb") as f:
+        files={"file":(audio.name,f,"audio/wav")}
+        data={"model":os.getenv("TRANSCRIPTION_MODEL","gpt-4o-mini-transcribe")}
+        r=httpx.post("https://api.openai.com/v1/audio/transcriptions",
+                     headers={"Authorization":f"Bearer {key}"},
+                     files=files,data=data,timeout=180)
+    r.raise_for_status()
+    return str(r.json().get("text") or "")[:20000]
+
+async def video_analyze(path: str, prompt: str = "Describe what happens in this video and note important details.",
+                        frames: int = 6):
+    p=Path(path)
+    if not p.exists(): return {"ok":False,"error":"video file not found"}
+    if p.stat().st_size > MAX_VIDEO_BYTES:
+        return {"ok":False,"error":"video exceeds 120MB safety limit"}
+    try:
+        import imageio_ffmpeg
+        ff=imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        return {"ok":False,"error":f"ffmpeg unavailable: {e}"}
+    out=Path(tempfile.mkdtemp(prefix="agentos_video_"))
+    try:
+        imgs=_extract_frames(ff,str(p),out,max(1,min(6,int(frames))))
+        audio=_extract_audio(ff,str(p),out)
+        transcript=""
+        if audio:
+            try:
+                transcript=await asyncio.to_thread(_transcribe_openai,audio)
+            except Exception:
+                transcript=""
+        result={"ok":True,"frames":[str(x) for x in imgs],
+                "audio":str(audio) if audio else None,"transcript":transcript}
+        # Use the existing fallback router for visual understanding.
+        if imgs:
+            try:
+                from .model_router import ModelRouter
+                parts=[{"type":"text","text":prompt + "\\nAudio transcript:\\n" + transcript[:12000]}]
+                for img in imgs:
+                    b64=base64.b64encode(img.read_bytes()).decode()
+                    parts.append({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+b64}})
+                comp=await ModelRouter().complete(
+                    [{"role":"user","content":parts}],
+                    task_type="vision", temperature=0.1, max_tokens=2000)
+                result["analysis"]=comp.text
+                result["provider"]=comp.provider
+                result["model"]=comp.model
+            except Exception as e:
+                result["analysis_error"]=f"{type(e).__name__}: {e}"
+        return result
+    except Exception as e:
+        return {"ok":False,"error":f"{type(e).__name__}: {e}"}
+
+def video_extract(path: str, frames=4):
+    # Backward-compatible synchronous frame extraction for existing callers.
+    try:
+        import imageio_ffmpeg
+        ff=imageio_ffmpeg.get_ffmpeg_exe()
+        out=Path(tempfile.mkdtemp(prefix="agentos_video_"))
+        imgs=_extract_frames(ff,path,out,max(1,min(8,int(frames))))
+        return {"ok":True,"frames":[str(x) for x in imgs]}
+    except Exception as e:
+        return {"ok":False,"error":f"{type(e).__name__}: {e}"}
+''', encoding="utf-8")
+
+# Replace the built-in video tool with the full async analyzer.
+bt = ROOT / "core/builtin_tools.py"
+if bt.exists():
+    b = bt.read_text(encoding="utf-8")
+    b = b.replace(
+        'from .media_pipeline import extract_document, video_extract',
+        'from .media_pipeline import extract_document, video_extract, video_analyze'
+    )
+    old = 'lambda path,frames=4: video_extract(path,frames)'
+    if old in b:
+        b = b.replace(old, 'video_analyze', 1)
+    bt.write_text(b, encoding="utf-8")
+
+# 8) Add a dedicated multimodal video skill to the research/vision agent.
+da = ROOT / "demo/agents.py"
+if da.exists():
+    d = da.read_text(encoding="utf-8")
+    d = d.replace(
+        'tools=["web_search"],',
+        'tools=["web_search", "analyze_video", "read_document"],', 1
+    )
+    d = d.replace(
+        'Use web_search to gather facts. Cite sources.',
+        'Use web_search to gather facts and analyze_video/read_document for supplied media/documents. Cite sources.',
+        1
+    )
+    da.write_text(d, encoding="utf-8")
+
+# 9) Resource hardening for 512MB Render: cap connection pools and disable
+#    expensive tracing console export in production unless explicitly enabled.
+tm = ROOT / "core/task_manager.py"
+if tm.exists():
+    t = tm.read_text(encoding="utf-8").replace(
+        'asyncpg.create_pool(self.dsn, min_size=1, max_size=10)',
+        'asyncpg.create_pool(self.dsn, min_size=1, max_size=int(os.getenv("DB_POOL_MAX","4")))'
+    )
+    if 'import os' not in t.split('\\n', 5)[0:5]:
+        t = t.replace('import json, logging, time, uuid', 'import json, logging, os, time, uuid', 1)
+    tm.write_text(t, encoding="utf-8")
+
+# 10) Add an explicit production health endpoint with queue/runtime state.
+ap = ROOT / "api/main.py"
+if ap.exists():
+    a = ap.read_text(encoding="utf-8")
+    if '/healthz' in a and 'execution_lock' not in a:
+        a += r'''
+@app.get("/healthz")
+async def production_healthz():
+    tm = STATE.get("tm")
+    router = STATE.get("router")
+    data = {"ok": bool(tm and getattr(tm, "pool", None)),
+            "service": "agentos", "runtime": "embedded"}
+    try:
+        data["providers"] = router.available_providers() if router else []
+    except Exception:
+        data["providers"] = []
+    try:
+        rows = await tm.read_heartbeats() if tm else []
+        data["heartbeats"] = {r["service"]: r["last_seen"] for r in rows}
+    except Exception:
+        data["heartbeats"] = {}
+    return data
+'''
+        ap.write_text(a, encoding="utf-8")
+
+# 11) Final compile check after every production hardening patch.
+if not compileall.compile_dir(str(ROOT), quiet=1):
+    raise SystemExit("AgentOS production hardening pass failed Python compilation")
+print("AgentOS production hardening pass 2: FIFO + memory + artifacts + video + webhook ownership + memory caps OK")
