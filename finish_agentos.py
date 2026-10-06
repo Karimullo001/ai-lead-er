@@ -186,7 +186,7 @@ wp=ROOT/"core/worker.py"
 if wp.exists():
     s=wp.read_text(encoding="utf-8")
     if "from core.builtin_tools import register_builtins" not in s:
-        s="from core.builtin_tools import register_builtins\n"+s
+        s=s.replace("from __future__ import annotations", "from __future__ import annotations\nfrom core.builtin_tools import register_builtins", 1) if "from __future__ import annotations" in s else "from core.builtin_tools import register_builtins\n"+s
     if "register_builtins(self.tools)" not in s:
         m=re.search(r"self\.tools\s*=\s*ToolRegistry\(\)",s)
         if m: s=s[:m.end()]+ "\n        register_builtins(self.tools)"+s[m.end():]
