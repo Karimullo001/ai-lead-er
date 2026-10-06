@@ -396,3 +396,19 @@ async def document_handler(message: Message):
     return s.replace(marker,block+marker,1)
 
 patch_file("telegram_bot/handlers.py", patch_media_handlers)
+
+def patch_memory_notifier(s):
+    if "ConversationMemory" in s and "conv.append" in s:
+        return s
+    needle='''                await notifier.send(chat_id, "✅ Task completed " + short + "\\n⏱ " + str(int(elapsed)) + "s\\n\\n" + raw.strip()[:3000])'''
+    repl=needle+'''\n                try:
+                    from core.conversation_memory import ConversationMemory
+                    cm=ConversationMemory(tm.pool); await cm.ensure()
+                    await cm.append(str(r.get("user_id") or ""), str(chat_id), "assistant", raw.strip()[:12000])
+                except Exception as exc:
+                    log.debug("assistant memory save failed: %s", exc)'''
+    if needle in s:
+        return s.replace(needle,repl,1)
+    return s
+
+patch_file("telegram_bot/bot.py", patch_memory_notifier)
