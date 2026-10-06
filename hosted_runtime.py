@@ -79,6 +79,7 @@ async def _telegram_runtime() -> None:
     log.info("Telegram runtime: handler agents ready")
 
     notifier = get_notifier()
+    log.info("Telegram runtime: notifier object ready")
     await notifier.start()
     log.info("Telegram runtime: notifier ready")
     STATE.update(
@@ -86,12 +87,13 @@ async def _telegram_runtime() -> None:
         approval=approval, notifier=notifier, redis_url=redis_url
     )
 
+    log.info("Telegram runtime: creating polling bot")
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher()
     dp.message.middleware(AuthMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
     dp.include_router(router)
-
+    log.info("Telegram runtime: dispatcher ready")
     log.info("Telegram polling starting")
     try:
         me = await bot.get_me()
