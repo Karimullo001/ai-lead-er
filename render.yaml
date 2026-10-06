@@ -4,9 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && pip install -e .
-    startCommand: >-
-      python -c 'from pathlib import Path; p=Path("api/main.py"); s=p.read_text(); s=s.replace("STATE: Dict[str, Any] = {}", "STATE: Dict[str, Any] = {}\\nHOSTED_RUNTIME: Dict[str, Any] = {}", 1); old="    STATE.update(dict(tm=tm, queue=q, router=router, cost=cost, redis_url=redis_url))\\n    log.info("API ready with providers: %s", router.available_providers())\\n    yield\\n    await q.close(); await tm.close()\\n    STATE.clear()"; new="    STATE.update(dict(tm=tm, queue=q, router=router, cost=cost, redis_url=redis_url))\\n    log.info("API ready with providers: %s", router.available_providers())\\n    if os.getenv("EMBEDDED_RUNTIME", "true").lower() == "true":\\n        from hosted_runtime import start_hosted_runtime\\n        HOSTED_RUNTIME.update(await start_hosted_runtime())\\n    yield\\n    if HOSTED_RUNTIME:\\n        from hosted_runtime import stop_hosted_runtime\\n        await stop_hosted_runtime(HOSTED_RUNTIME)\\n        HOSTED_RUNTIME.clear()\\n    await q.close(); await tm.close()\\n    STATE.clear()"; s=s.replace(old,new,1); p.write_text(s)'; uvicorn api.main:app --host 0.0.0.0 --port $PORT
-    
+    startCommand: python hosted_start.py
     envVars:
       - key: DATABASE_URL
         fromDatabase:
