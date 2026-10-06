@@ -932,7 +932,9 @@ from api.main import app
 
 async def _boot_runtime():
     from hosted_runtime import start_hosted_runtime
-    return await start_hosted_runtime()
+    state = await start_hosted_runtime()
+    app.state.agentos_runtime = state
+    return state
 
 async def _shutdown_runtime(state):
     from hosted_runtime import stop_hosted_runtime
