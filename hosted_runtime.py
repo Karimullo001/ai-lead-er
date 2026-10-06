@@ -15,7 +15,7 @@ log = logging.getLogger("agentos.hosted")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
-async def _telegram_runtime() -> None:
+async def _telegram_runtime(ready_event: asyncio.Event | None = None) -> None:
     from aiogram import Bot, Dispatcher
     from aiogram.client.default import DefaultBotProperties
     from aiogram.enums import ParseMode
@@ -123,6 +123,9 @@ async def _telegram_runtime() -> None:
     try:
         me = await bot.get_me()
         log.info("Telegram bot connected as @%s", me.username or me.id)
+        if ready_event is not None:
+            ready_event.set()
+            log.info("Telegram runtime ready; worker startup may begin")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except asyncio.CancelledError:
         raise
@@ -163,13 +166,18 @@ async def _worker_runtime() -> None:
 async def _supervisor(worker_executor: ThreadPoolExecutor) -> None:
     log.info("Hosted runtime supervisor starting")
 
-    # Start Telegram first. Worker initialization can be CPU-heavy and must
-    # never delay the Telegram event loop.
+    # Fully initialize Telegram before starting the worker. Worker startup can
+    # import heavy modules and trigger model/cache downloads; starting it too
+    # early can delay Telegram initialization on a single Free Render instance.
+    telegram_ready = asyncio.Event()
     telegram_task = asyncio.create_task(
-        _telegram_runtime(), name="agentos-telegram-embedded"
+        _telegram_runtime(telegram_ready), name="agentos-telegram-embedded"
     )
 
-    await asyncio.sleep(0.25)
+    try:
+        await asyncio.wait_for(telegram_ready.wait(), timeout=30.0)
+    except asyncio.TimeoutError:
+        log.error("Telegram did not become ready within 30s; worker startup continues")
 
     worker_task = asyncio.get_running_loop().run_in_executor(
         worker_executor, _worker_thread_entry
