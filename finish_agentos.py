@@ -913,16 +913,37 @@ if not compileall.compile_dir(str(ROOT), quiet=1):
 print("AgentOS native tool calls preserved")
 
 
-# Render entrypoint: api.main already owns the embedded worker/Telegram
-# lifespan. Do not wrap it a second time, which starts a duplicate runtime
-# and can prevent Uvicorn from completing startup.
+
+# Render entrypoint: keep exactly one embedded runtime. api.main has its
+# lifespan runtime disabled here, while this entrypoint starts it once.
 hs = ROOT / "hosted_start.py"
 hs.write_text(r'''"""Single-process Render entrypoint for AgentOS."""
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
+
 import uvicorn
+
+os.environ["EMBEDDED_RUNTIME"] = "false"
+
 from api.main import app
+
+_original_lifespan = app.router.lifespan_context
+
+@asynccontextmanager
+async def _hosted_lifespan(application):
+    runtime = None
+    async with _original_lifespan(application):
+        from hosted_runtime import start_hosted_runtime, stop_hosted_runtime
+        runtime = await start_hosted_runtime()
+        try:
+            yield
+        finally:
+            if runtime:
+                await stop_hosted_runtime(runtime)
+
+app.router.lifespan_context = _hosted_lifespan
 
 uvicorn.run(
     app,
