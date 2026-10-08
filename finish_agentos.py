@@ -1110,3 +1110,117 @@ if _hp.exists():
         _h = _h.replace(_bs * 2 + "n", _bs + "n")
         _hp.write_text(_h, encoding="utf-8")
         print("AgentOS Telegram fix: literal \\\\n -> newline in handler messages")
+
+CHAT_BLOCK = """
+
+# ---- chat vs task routing (added by final pass) ----
+import re as _re
+
+_TASK_RE = _re.compile(
+    r"\\b(research|build|create|make|generate|write|code|develop|implement|deploy|"
+    r"analy[sz]e|scrape|crawl|download|summari[sz]e|translate|draw|design|compare|"
+    r"find|search|fix|debug|refactor|convert|plan|"
+    r"yarat|tuz|yoz|qil|top|tahlil|izla|yuklab|chiz|"
+    r"сделай|создай|напиши|найди|исследуй|разработай|проанализируй|сгенерируй|нарисуй)\\b",
+    _re.I)
+_TASK_NOUNS = _re.compile(
+    r"\\b(image|video|pdf|docx|excel|spreadsheet|website|app|script|report|file|"
+    r"rasm|sayt|ilova|fayl|hisobot|картинк|видео|сайт|приложени|файл|отчет|отчёт)\\w*", _re.I)
+_FORCE_RE = _re.compile(r"^\\s*(?:/task|task:|vazifa:|задача:)\\s*(.+)$", _re.I | _re.S)
+_CHAT_HISTORY: dict = {}
+
+
+def _looks_like_task(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) > 400:
+        return True
+    return bool(_TASK_RE.search(t) and (_TASK_NOUNS.search(t) or len(t.split()) >= 6)
+                and not _re.match(r"^(what|who|why|how|when|nima|qanday|nega|кто|что|как|почему)\\b", t, _re.I))
+
+
+async def _chat_or_task(message, text: str) -> None:
+    m = _FORCE_RE.match(text)
+    if m:
+        await _create_task_and_ack(message, m.group(1).strip())
+        return
+    if _looks_like_task(text):
+        await _create_task_and_ack(message, text)
+        return
+    await _chat_reply(message, text)
+
+
+async def _chat_reply(message, text: str) -> None:
+    router = STATE.get("router")
+    if router is None:
+        await message.answer("\\u26a0\\ufe0f AI runtime is not ready yet. Please retry in a moment.")
+        return
+    hist = _CHAT_HISTORY.setdefault(message.chat.id, [])
+    msgs = [{"role": "system", "content": (
+        "You are AgentOS, a friendly, concise assistant. Reply in the same language the user writes in "
+        "(Uzbek, Russian or English). Answer simple questions and casual chat directly. If the user "
+        "wants real work done (research, code, files, images), ask them to describe the task.")}]
+    msgs += hist[-10:] + [{"role": "user", "content": text}]
+    try:
+        try:
+            await message.bot.send_chat_action(message.chat.id, "typing")
+        except Exception:
+            pass
+        comp = await asyncio.wait_for(
+            router.complete(msgs, task_type="general", max_tokens=700, temperature=0.5), timeout=75)
+        answer = (comp.text or "").strip() or "(empty reply from model)"
+    except Exception as e:
+        log.warning("chat reply failed: %s", e)
+        await message.answer("\\u26a0\\ufe0f I couldn't get an answer from the AI providers right now: "
+                             + str(e)[:200], parse_mode=None)
+        return
+    hist.append({"role": "user", "content": text})
+    hist.append({"role": "assistant", "content": answer})
+    del hist[:-20]
+    await message.answer(answer[:4000], parse_mode=None)
+"""
+
+
+# ---------------------------------------------------------------------
+# Reliability + chat routing (hang fix).
+#  1. LLM calls had no timeout: one hung provider call held the global FIFO
+#     execution lock and blocked every later task. Add a per-call timeout.
+#  2. Worker had no per-task limit: wrap _run_task in wait_for.
+#  3. Every non-greeting message became a background task. Plain chat now
+#     gets a direct one-call reply; only real work becomes a task.
+# ---------------------------------------------------------------------
+_lp = ROOT / "core/providers/_litellm_base.py"
+if _lp.exists():
+    _l = _lp.read_text(encoding="utf-8")
+    _a = "        call_kwargs.update(kwargs)\n"
+    if "call_kwargs.setdefault(\"timeout\"" not in _l and _a in _l:
+        _l = _l.replace(_a, "        call_kwargs.setdefault(\"timeout\", 60)\n" + _a, 1)
+        _lp.write_text(_l, encoding="utf-8")
+        print("AgentOS hang fix: 60s timeout on LLM calls")
+
+_wp = ROOT / "core/worker.py"
+if _wp.exists():
+    _w = _wp.read_text(encoding="utf-8")
+    _a = "                await self._run_task(task_id)\n                await self.queue.ack(entry_id)\n"
+    _b = ("                await asyncio.wait_for(\n"
+          "                    self._run_task(task_id),\n"
+          "                    timeout=float(os.getenv(\"TASK_TIMEOUT_SECONDS\", \"900\")))\n"
+          "                await self.queue.ack(entry_id)\n")
+    if "TASK_TIMEOUT_SECONDS" not in _w and _a in _w:
+        _w = _w.replace(_a, _b, 1)
+        _wp.write_text(_w, encoding="utf-8")
+        print("AgentOS hang fix: per-task timeout")
+
+_hp = ROOT / "telegram_bot/handlers.py"
+if _hp.exists():
+    _h = _hp.read_text(encoding="utf-8")
+    _old = ('        await message.answer("\U0001F44B Salom! Men AgentOSman. Nima qilamiz?")\n'
+            '        return\n'
+            '    await _create_task_and_ack(message, text)\n')
+    _new = ('        await message.answer("\U0001F44B Salom! Men AgentOSman. Nima qilamiz?")\n'
+            '        return\n'
+            '    await _chat_or_task(message, text)\n')
+    if "_chat_or_task" not in _h and _old in _h:
+        _h = _h.replace(_old, _new, 1)
+        _h += CHAT_BLOCK
+        _hp.write_text(_h, encoding="utf-8")
+        print("AgentOS chat routing: chat replies directly, tasks only for real work")
