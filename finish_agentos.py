@@ -1149,33 +1149,121 @@ async def _chat_or_task(message, text: str) -> None:
     await _chat_reply(message, text)
 
 
+_PERSONA = (
+    "Sen foydalanuvchining shaxsiy AI yordamchisisan (AgentOS). Do'stona, norasmiy va qisqa gapir: "
+    "foydalanuvchiga 'sen' deb murojaat qil, 'Sizga qanday yordam bera olaman?' kabi rasmiy iboralardan qoch. "
+    "Foydalanuvchi qaysi tilda yozsa (o'zbek, rus, ingliz) shu tilda, shunday norasmiy ohangda javob ber. "
+    "Sening doimiy xotirang bor: pastdagi 'Foydalanuvchi haqida bilganlaring' va oxirgi suhbat tarixi. "
+    "Hech qachon 'suhbatni eslab qolmayman' dema. Bilmagan narsangni o'ylab topma. "
+    "Agar foydalanuvchi haqiqiy ish so'rasa (sayt, rasm, taqdimot, kod, tadqiqot), uni aniq tasvirlashini ayt, "
+    "shunda sen buni vazifa sifatida ishga tushirasan."
+)
+_FACT_CUES = _re.compile(
+    r"(mening|menga|ismim|yashayman|ishlayman|o'qiyman|yoqadi|eslab qol|esingda tut|"
+    r"меня зовут|я живу|я работаю|люблю|запомни|my name|i am|i'm|i live|i work|i like|i love|remember)", _re.I)
+_BG: set = set()
+_CONV_READY: dict = {}
+
+
+def _uid(message) -> str:
+    return str(message.from_user.id if message.from_user else message.chat.id)
+
+
+async def _load_profile(pool, uid: str) -> list:
+    try:
+        async with pool.acquire() as c:
+            rows = await c.fetch(
+                "SELECT content FROM memory_items WHERE user_id=$1 AND kind='profile_fact' "
+                "ORDER BY created_at DESC LIMIT 25", uid)
+        return [r["content"] for r in rows]
+    except Exception as e:
+        log.warning("profile load failed: %s", e)
+        return []
+
+
+async def _load_history(pool, uid: str, chat_id: int, limit: int = 12) -> list:
+    try:
+        if not _CONV_READY.get("ok"):
+            from core.conversation_memory import ConversationMemory
+            await ConversationMemory(pool).ensure()
+            _CONV_READY["ok"] = True
+        async with pool.acquire() as c:
+            rows = await c.fetch(
+                "SELECT role,content FROM conversation_messages WHERE user_id=$1 AND chat_id=$2 "
+                "ORDER BY created_at DESC LIMIT $3", uid, str(chat_id), limit)
+        return [{"role": r["role"], "content": str(r["content"])[:1500]} for r in reversed(rows)]
+    except Exception as e:
+        log.warning("history load failed: %s", e)
+        return []
+
+
+async def _save_turn(pool, uid: str, chat_id: int, user_text: str, answer: str) -> None:
+    try:
+        from core.conversation_memory import ConversationMemory
+        cm = ConversationMemory(pool)
+        await cm.append(uid, str(chat_id), "user", user_text)
+        await cm.append(uid, str(chat_id), "assistant", answer)
+    except Exception as e:
+        log.warning("history save failed: %s", e)
+
+
+async def _extract_facts(router, tm, uid: str, text: str) -> None:
+    try:
+        comp = await asyncio.wait_for(router.complete(
+            [{"role": "system", "content": (
+                "Extract durable personal facts about the user from their message (name, city, job, "
+                "projects, preferences, goals). Return ONLY JSON like {\\"facts\\": [\\"short fact\\"]}. "
+                "Use the user's own language. Return {\\"facts\\": []} if there is nothing durable.")},
+             {"role": "user", "content": text}],
+            task_type="general", max_tokens=200, temperature=0.0), timeout=40)
+        raw = (comp.text or "").replace("```json", "").replace("```", "").strip()
+        facts = json.loads(raw).get("facts", [])
+        existing = set(await _load_profile(tm.pool, uid))
+        for f in facts[:5]:
+            f = str(f).strip()[:200]
+            if f and f not in existing:
+                await tm.remember(uid, f, kind="profile_fact", importance=0.9)
+    except Exception as e:
+        log.info("fact extraction skipped: %s", e)
+
+
 async def _chat_reply(message, text: str) -> None:
     router = STATE.get("router")
+    tm = STATE.get("tm")
     if router is None:
         await message.answer("\\u26a0\\ufe0f AI runtime is not ready yet. Please retry in a moment.")
         return
-    hist = _CHAT_HISTORY.setdefault(message.chat.id, [])
-    msgs = [{"role": "system", "content": (
-        "You are AgentOS, a friendly, concise assistant. Reply in the same language the user writes in "
-        "(Uzbek, Russian or English). Answer simple questions and casual chat directly. If the user "
-        "wants real work done (research, code, files, images), ask them to describe the task.")}]
-    msgs += hist[-10:] + [{"role": "user", "content": text}]
+    pool = getattr(tm, "pool", None)
+    uid = _uid(message)
+    facts = await _load_profile(pool, uid) if pool else []
+    hist = await _load_history(pool, uid, message.chat.id) if pool else \
+        _CHAT_HISTORY.setdefault(message.chat.id, [])[-10:]
+    system = _PERSONA + "\\n\\nFoydalanuvchi haqida bilganlaring:\\n" + (
+        "\\n".join("- " + f for f in facts) if facts else "(hozircha hech narsa)")
+    msgs = [{"role": "system", "content": system}] + hist + [{"role": "user", "content": text}]
     try:
         try:
             await message.bot.send_chat_action(message.chat.id, "typing")
         except Exception:
             pass
         comp = await asyncio.wait_for(
-            router.complete(msgs, task_type="general", max_tokens=700, temperature=0.5), timeout=75)
+            router.complete(msgs, task_type="general", max_tokens=700, temperature=0.6), timeout=75)
         answer = (comp.text or "").strip() or "(empty reply from model)"
     except Exception as e:
         log.warning("chat reply failed: %s", e)
         await message.answer("\\u26a0\\ufe0f I couldn't get an answer from the AI providers right now: "
                              + str(e)[:200], parse_mode=None)
         return
-    hist.append({"role": "user", "content": text})
-    hist.append({"role": "assistant", "content": answer})
-    del hist[:-20]
+    if pool:
+        await _save_turn(pool, uid, message.chat.id, text, answer)
+        if _FACT_CUES.search(text):
+            t = asyncio.create_task(_extract_facts(router, tm, uid, text))
+            _BG.add(t)
+            t.add_done_callback(_BG.discard)
+    else:
+        h = _CHAT_HISTORY.setdefault(message.chat.id, [])
+        h += [{"role": "user", "content": text}, {"role": "assistant", "content": answer}]
+        del h[:-20]
     await message.answer(answer[:4000], parse_mode=None)
 """
 
@@ -1224,3 +1312,25 @@ if _hp.exists():
         _h += CHAT_BLOCK
         _hp.write_text(_h, encoding="utf-8")
         print("AgentOS chat routing: chat replies directly, tasks only for real work")
+
+
+# Redis: a blocking XREADGROUP could hit the client's default socket timeout and crash the worker loop.
+_qp = ROOT / "core/queue.py"
+if _qp.exists():
+    _q = _qp.read_text(encoding="utf-8")
+    _a = "aioredis.from_url(self.redis_url, decode_responses=True)"
+    if _a in _q and "socket_timeout" not in _q:
+        _q = _q.replace(_a, "aioredis.from_url(self.redis_url, decode_responses=True, socket_timeout=30, "
+                            "socket_connect_timeout=10, health_check_interval=30)", 1)
+        _qp.write_text(_q, encoding="utf-8")
+        print("AgentOS redis fix: socket timeouts")
+_wp = ROOT / "core/worker.py"
+if _wp.exists():
+    _w = _wp.read_text(encoding="utf-8")
+    _a = '                log.exception("Task %s crashed", task_id or "?")\n                if task_id:\n'
+    if _a in _w and "await asyncio.sleep(1)" not in _w.split(_a)[1][:200]:
+        _w = _w.replace(_a, '                log.exception("Task %s crashed", task_id or "?")\n'
+                            '                if not task_id:\n                    await asyncio.sleep(1)\n'
+                            '                if task_id:\n', 1)
+        _wp.write_text(_w, encoding="utf-8")
+        print("AgentOS worker fix: back off after loop errors")
