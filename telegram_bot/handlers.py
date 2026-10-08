@@ -108,6 +108,58 @@ async def cmd_web(message: Message, command: CommandObject):
     await handle_website_generation(message, prompt)
 
 
+@router.message(Command("fullstack"))
+@router.message(Command("app"))
+async def cmd_fullstack(message: Message, command: CommandObject):
+    prompt = (command.args or "").strip()
+    if not prompt:
+        await message.answer("ℹ️ *Foydalanish:* `/fullstack <loyiha tavsifi>`\nMisol: `/fullstack CRM tizimi: FastAPI backend va React dashboard`", parse_mode="Markdown")
+        return
+    await handle_fullstack_generation(message, prompt)
+
+
+@router.message(Command("plugins"))
+@router.message(Command("integrations"))
+async def cmd_plugins(message: Message):
+    from core.plugins import get_plugin_manager
+    pm = get_plugin_manager()
+    await message.answer(pm.get_overview_markdown(), parse_mode="Markdown")
+
+
+@router.message(Command("github"))
+async def cmd_github(message: Message, command: CommandObject):
+    from core.plugins import get_plugin_manager
+    pm = get_plugin_manager()
+    gh = pm.get_plugin("github")
+    if not gh or not gh.is_configured():
+        await message.answer("⚠️ GitHub integratsiyasi hali ulanmagan.\nServer muhitida `GITHUB_TOKEN` yoki `GITHUB_PAT` sozlanishi lozim.", parse_mode="Markdown")
+        return
+    args = (command.args or "").strip()
+    if not args:
+        res = await gh.execute("list_repos", {}, _uid(message))
+        if res.success:
+            repos = res.data or []
+            lines = ["📦 *GitHub Repositoriyalaringiz:*\n"]
+            for r in repos[:10]:
+                lines.append(f"• [{r['name']}]({r['url']}) {'(🔒 private)' if r['private'] else ''}")
+            await message.answer("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+            return
+        await message.answer(f"⚠️ Xatolik: {res.error}")
+        return
+    # Natural subcommands
+    parts = args.split(maxsplit=1)
+    subcmd = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    if subcmd == "create":
+        res = await gh.execute("create_repo", {"name": rest}, _uid(message))
+        if res.success:
+            await message.answer(f"✅ Yangi GitHub repozitoriy yaratildi:\n{res.data.get('html_url')}")
+        else:
+            await message.answer(f"❌ Repozitoriy yaratishda xatolik: {res.error}")
+    else:
+        await message.answer("ℹ️ *Foydalanish:* `/github` (ro'yxatni ko'rish) yoki `/github create <repo_nomi>`", parse_mode="Markdown")
+
+
 @router.message(Command("presentation"))
 @router.message(Command("slides"))
 async def cmd_presentation(message: Message, command: CommandObject):
@@ -790,6 +842,12 @@ _VIDEO_GEN_RE = _re.compile(
     r"\bgenerate\s+video|\bcreate\s+video|\bmake\s+a\s+video)",
     _re.I)
 
+_FULLSTACK_GEN_RE = _re.compile(
+    r"(?:^/fullstack|^/app|\bfull-?stack|\bto'liq\s+ilova|\bfastapi\s+va\s+react|"
+    r"\bbackend\s+va\s+frontend|\bсоздай\s+fullstack|\bсоздай\s+приложени|"
+    r"\bbuild\s+fullstack|\bcreate\s+full-?stack\s+app|\bcreate\s+web\s+app)",
+    _re.I)
+
 _WEBSITE_GEN_RE = _re.compile(
     r"(?:^/web|^/website|^/site|\bsayt\s+(?:yarat|tuz|qilib\s+ber)|\bveb\s*sayt|\blanding\s+page|"
     r"\bсоздай\s+сайт|\bсделай\s+сайт|\bнапиши\s+сайт|"
@@ -802,15 +860,23 @@ _PRESENTATION_GEN_RE = _re.compile(
     r"\bcreate\s+a?\s*presentation|\bmake\s+a?\s*presentation|\bgenerate\s+slides)",
     _re.I)
 
+_PLUGINS_RE = _re.compile(
+    r"(?:^/plugins|^/integrations|\bplaginlar|\bintegratsiyalar|\bulangan\s+servislar|\bconnectors)",
+    _re.I)
+
+_GITHUB_ACTION_RE = _re.compile(
+    r"(?:^/github|\bgithub\s+(?:ga\s+yukla|repo|repository|da\s+och|ga\s+push))",
+    _re.I)
+
 
 async def handle_image_generation(message: Message, prompt: str):
     clean_p = _IMAGE_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
-    status_msg = await message.answer(f"🎨 *\"{clean_p}\"*\n_Tasvir chizilmoqda, bir oz kuting..._", parse_mode="Markdown")
+    status_msg = await message.answer(f"🎨 *\"{clean_p}\"*\n_Tasvir chizilmoqda (Google Imagen / DALL-E / Flux)..._", parse_mode="Markdown")
     try:
         from core.media_generator import generate_image
         img_bytes = await generate_image(clean_p)
         if not img_bytes:
-            await status_msg.edit_text("⚠️ Rasmni chizishda xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
+            await status_msg.edit_text("⚠️ Rasmni chizishda provayderlar band yoki xatolik yuz berdi. Qayta urinib ko'ring.")
             return
 
         try:
@@ -818,7 +884,7 @@ async def handle_image_generation(message: Message, prompt: str):
         except Exception:
             pass
 
-        caption = f"✨ *{clean_p}*\n_Agent tomonidan yaratildi (2026)_"
+        caption = f"✨ *{clean_p}*\n_AgentOS Visual Engine (2026)_"
         await message.answer_photo(
             BufferedInputFile(img_bytes, filename="generated.jpg"),
             caption=caption[:1000],
@@ -831,12 +897,19 @@ async def handle_image_generation(message: Message, prompt: str):
 
 async def handle_video_generation(message: Message, prompt: str):
     clean_p = _VIDEO_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
-    status_msg = await message.answer(f"🎬 *\"{clean_p}\"*\n_Video render qilinmoqda, bir oz kuting..._", parse_mode="Markdown")
+    status_msg = await message.answer(f"🎬 *\"{clean_p}\"*\n_Video render pipeline ishga tushirildi..._", parse_mode="Markdown")
+
+    async def _on_status(text: str):
+        try:
+            await status_msg.edit_text(f"🎬 *\"{clean_p}\"*\n_{text}_", parse_mode="Markdown")
+        except Exception:
+            pass
+
     try:
         from core.media_generator import generate_video
-        vid_bytes = await generate_video(clean_p)
+        vid_bytes = await generate_video(clean_p, on_status=_on_status)
         if not vid_bytes:
-            await status_msg.edit_text("⚠️ Video render qilishda xatolik yuz berdi yoki servis band. Qayta urinib ko'ring.")
+            await status_msg.edit_text("⚠️ Video render qilishda xatolik yuz berdi. Qayta urinib ko'ring.")
             return
 
         try:
@@ -844,9 +917,9 @@ async def handle_video_generation(message: Message, prompt: str):
         except Exception:
             pass
 
-        caption = f"🎬 *{clean_p}*"
+        caption = f"🎬 *{clean_p}*\n_AgentOS Video Pipeline (2026)_"
         await message.answer_video(
-            BufferedInputFile(vid_bytes, filename="video.mp4"),
+            BufferedInputFile(vid_bytes, filename="generated.mp4"),
             caption=caption[:1000],
             parse_mode="Markdown"
         )
@@ -862,10 +935,17 @@ async def handle_website_generation(message: Message, prompt: str):
         await message.answer("⚠️ AI tizimi hali tayyor emas.")
         return
 
-    status_msg = await message.answer(f"💻 *\"{clean_p}\"*\n_Mukammal veb-sayt (HTML5/Tailwind/JS) kodlanmoqda..._", parse_mode="Markdown")
+    status_msg = await message.answer(f"💻 *\"{clean_p}\"*\n_Internet trendlari va UI/UX tahlil qilinmoqda..._", parse_mode="Markdown")
+
+    async def _on_status(text: str):
+        try:
+            await status_msg.edit_text(f"💻 *\"{clean_p}\"*\n_{text}_", parse_mode="Markdown")
+        except Exception:
+            pass
+
     try:
         from core.media_generator import generate_website
-        html_code = await generate_website(clean_p, router)
+        html_code = await generate_website(clean_p, router, on_status=_on_status)
         if not html_code or len(html_code) < 100:
             await status_msg.edit_text("⚠️ Veb-sayt kodini yaratib bo'lmadi.")
             return
@@ -889,6 +969,49 @@ async def handle_website_generation(message: Message, prompt: str):
     except Exception as e:
         log.exception("Website gen failed: %s", e)
         await status_msg.edit_text(f"⚠️ Sayt yaratishda xatolik: {str(e)[:150]}")
+
+
+async def handle_fullstack_generation(message: Message, prompt: str):
+    clean_p = _FULLSTACK_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
+    router = STATE.get("router")
+    if router is None:
+        await message.answer("⚠️ AI tizimi hali tayyor emas.")
+        return
+
+    status_msg = await message.answer(f"⚙️ *\"{clean_p}\"*\n_Full-stack loyiha arxitekturasi va kodlari ishlab chiqilmoqda..._", parse_mode="Markdown")
+
+    async def _on_status(text: str):
+        try:
+            await status_msg.edit_text(f"⚙️ *\"{clean_p}\"*\n_{text}_", parse_mode="Markdown")
+        except Exception:
+            pass
+
+    try:
+        from core.media_generator import generate_fullstack
+        zip_bytes, summary = await generate_fullstack(clean_p, router, on_status=_on_status)
+        if not zip_bytes or len(zip_bytes) < 100:
+            await status_msg.edit_text("⚠️ Full-stack loyihani paketlashda xatolik yuz berdi.")
+            return
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        caption = (
+            f"📦 *Full-Stack Loyiha Paketi:* _{clean_p[:60]}_\n\n"
+            f"✨ *Xulosa:* {summary[:300]}\n\n"
+            "📂 *Tarkibi:* FastAPI backend API, React / Next.js frontend, Docker va README yo'riqnomasi.\n"
+            "🚀 ZIP arxivni ochib, `README.md` bo'yicha darhol ishga tushirishingiz mumkin!"
+        )
+        await message.answer_document(
+            BufferedInputFile(zip_bytes, filename="fullstack_project.zip"),
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.exception("Fullstack gen failed: %s", e)
+        await status_msg.edit_text(f"⚠️ Full-stack yaratishda xatolik: {str(e)[:150]}")
 
 
 async def handle_presentation_generation(message: Message, prompt: str):
@@ -934,7 +1057,7 @@ async def _chat_or_task(message: Message, text: str) -> None:
         await _create_task_and_ack(message, m.group(1).strip())
         return
 
-    # Direct generative capabilities
+    # Direct generative & integration capabilities
     if _IMAGE_GEN_RE.search(text):
         await handle_image_generation(message, text)
         return
@@ -943,12 +1066,22 @@ async def _chat_or_task(message: Message, text: str) -> None:
         await handle_video_generation(message, text)
         return
 
+    if _FULLSTACK_GEN_RE.search(text):
+        await handle_fullstack_generation(message, text)
+        return
+
     if _WEBSITE_GEN_RE.search(text):
         await handle_website_generation(message, text)
         return
 
     if _PRESENTATION_GEN_RE.search(text):
         await handle_presentation_generation(message, text)
+        return
+
+    if _PLUGINS_RE.search(text):
+        from core.plugins import get_plugin_manager
+        pm = get_plugin_manager()
+        await message.answer(pm.get_overview_markdown(), parse_mode="Markdown")
         return
 
     # Direct conversational response
