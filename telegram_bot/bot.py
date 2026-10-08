@@ -67,13 +67,15 @@ async def main() -> None:
     dp = Dispatcher()
     await bot.set_my_commands([
         BotCommand(command="start", description="Boshlash / Yordam"),
-        BotCommand(command="search", description="Internetdan qidirish"),
-        BotCommand(command="voice", description="Ovozli javob rejimi (ON/OFF)"),
+        BotCommand(command="image", description="Rasm chizish (DALL-E / Flux)"),
+        BotCommand(command="video", description="Video yaratish"),
+        BotCommand(command="web", description="Veb-sayt / App yaratish"),
+        BotCommand(command="presentation", description="Taqdimot tayyorlash"),
+        BotCommand(command="search", description="Internetdan qidirish (2026)"),
+        BotCommand(command="voice", description="Ovozli javob rejimi"),
         BotCommand(command="clear", description="Suhbat tarixini tozalash"),
         BotCommand(command="memory", description="Eslab qolingan faktlar"),
         BotCommand(command="status", description="Tizim va AI holati"),
-        BotCommand(command="task", description="Fon vazifasi yaratish"),
-        BotCommand(command="tasks", description="Vazifalar ro'yxati"),
         BotCommand(command="help", description="Yordam"),
     ])
 

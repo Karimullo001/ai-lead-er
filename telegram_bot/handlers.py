@@ -1,6 +1,7 @@
 from __future__ import annotations
 import base64, mimetypes, tempfile
 import asyncio, json, logging, os, time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 from aiogram import Router, F
@@ -40,22 +41,27 @@ def progress_bar(p: float, width: int = 20) -> str:
 async def cmd_start(message: Message, command: CommandObject):
     name = message.from_user.first_name if message.from_user else "do'stim"
     await message.answer(
-        f"👋 Salom, {name}! Men sening shaxsiy AI yordamchingman.\n\n"
+        f"👋 Salom, {name}! Men sening shaxsiy AI hamkoring, kouching, CEO maslahatchisi va do'stingman.\n\n"
         "✨ *Imkoniyatlarim:*\n"
-        "• 💬 *Erkin suhbat:* Har qanday savolingizga tezkor va aqlli javoblar (Claude va ChatGPT)\n"
+        "• 💬 *Erkin va do'stona suhbat:* Biznes, startap, falsafa, dasturlash va har qanday savollar (Claude & ChatGPT)\n"
+        "• 🎨 *Rasm chizish:* `/image <tavsif>` yoki \"rasm chiz: ...\"\n"
+        "• 🎬 *Video yaratish:* `/video <tavsif>` yoki \"video yarat: ...\"\n"
+        "• 💻 *Veb-sayt yaratish:* `/web <tavsif>` — to'liq HTML/Tailwind/JS kod va fayl\n"
+        "• 📊 *Taqdimot tayyorlash:* `/presentation <mavzu>` — interaktiv Reveal.js slaydlar\n"
+        "• 🔍 *Jonli internet (2026):* `/search <so'rov>` orqali eng yangi ma'lumotlar\n"
         "• 🎙️ *Ovozli xabarlar:* Ovozli xabar yuboring — tinglab, tahlil qilib javob beraman\n"
-        "• 🖼️ *Rasm tahlili:* Rasm yoki skrinshot yuboring — ko'rib tushuntirib beraman\n"
-        "• 📄 *Hujjatlar:* PDF, Word, kod yoki matn fayllarini tahlil qilaman\n"
-        "• 🔍 *Jonli internet:* `/search <mavzu>` orqali yangilik va ma'lumotlar qidirish\n"
-        "• ⚡ *Tezkor oqim:* Javoblar jonli streaming rejimida yoziladi\n\n"
-        "🛠 *Buyruqlar:*\n"
-        "• /search <so'rov> — internetdan qidirish\n"
+        "• 🖼️ *Rasm va hujjatlar:* PDF, Word, kod yoki rasmlarni yuboring — tahlil qilaman\n"
+        "• ⚡ *Jonli oqim:* Javoblar tezkor streaming tarzida yoziladi\n\n"
+        "🛠 *Tezkor buyruqlar:*\n"
+        "• /image <tavsif> — rasm yaratish (DALL-E 3 / Flux)\n"
+        "• /video <tavsif> — video generatsiya qilish\n"
+        "• /web <tavsif> — tayyor veb-sayt yasash\n"
+        "• /presentation <mavzu> — taqdimot tayyorlash\n"
+        "• /search <so'rov> — internetdan qidirish (2026)\n"
         "• /voice — ovozli javob rejimini yoqish/o'chirish\n"
-        "• /clear yoki /reset — suhbat tarixini tozalash\n"
-        "• /memory — eslab qolingan ma'lumotlar\n"
+        "• /clear — suhbat tarixini tozalash\n"
+        "• /memory — eslab qolingan faktlarni ko'rish\n"
         "• /status — tizim va AI holati\n"
-        "• /task <vazifa> — uzoq muddatli fon vazifasini yaratish\n"
-        "• /tasks — vazifalar ro'yxati\n"
         "• /help — ushbu yordam xabari",
         parse_mode="Markdown"
     )
@@ -69,6 +75,47 @@ async def cmd_expert(message: Message):
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await cmd_start(message, None)  # type: ignore[arg-type]
+
+
+@router.message(Command("image"))
+@router.message(Command("draw"))
+@router.message(Command("imagine"))
+async def cmd_image(message: Message, command: CommandObject):
+    prompt = (command.args or "").strip()
+    if not prompt:
+        await message.answer("ℹ️ *Foydalanish:* `/image <tasvir tavsifi>`\nMisol: `/image Cyberpunk neon Tashkent 2026, 8k cinematic`", parse_mode="Markdown")
+        return
+    await handle_image_generation(message, prompt)
+
+
+@router.message(Command("video"))
+@router.message(Command("animate"))
+async def cmd_video(message: Message, command: CommandObject):
+    prompt = (command.args or "").strip()
+    if not prompt:
+        await message.answer("ℹ️ *Foydalanish:* `/video <video tavsifi>`\nMisol: `/video Drone shot of futuristic city sunset`", parse_mode="Markdown")
+        return
+    await handle_video_generation(message, prompt)
+
+
+@router.message(Command("web"))
+@router.message(Command("website"))
+async def cmd_web(message: Message, command: CommandObject):
+    prompt = (command.args or "").strip()
+    if not prompt:
+        await message.answer("ℹ️ *Foydalanish:* `/web <sayt tavsifi>`\nMisol: `/web Zamonaviy AI startap uchun landing page, dark mode va interaktiv narxlar kalkulyatori`", parse_mode="Markdown")
+        return
+    await handle_website_generation(message, prompt)
+
+
+@router.message(Command("presentation"))
+@router.message(Command("slides"))
+async def cmd_presentation(message: Message, command: CommandObject):
+    prompt = (command.args or "").strip()
+    if not prompt:
+        await message.answer("ℹ️ *Foydalanish:* `/presentation <mavzu>`\nMisol: `/presentation Sun'iy intellekt kelajagi va biznes strategiyalari 2026`", parse_mode="Markdown")
+        return
+    await handle_presentation_generation(message, prompt)
 
 
 @router.message(Command("search"))
@@ -225,11 +272,6 @@ async def cmd_task(message: Message, command: CommandObject):
 async def nl_handler(message: Message):
     text = (message.text or "").strip()
     if not text:
-        return
-    # Simple greetings should be answered directly, not scheduled as tasks.
-    greeting = text.lower().strip(" !?.")
-    if greeting in {"hi", "hello", "hey", "salom", "assalomu alaykum", "yo"}:
-        await message.answer("👋 Salom! Men AgentOSman. Nima qilamiz?")
         return
     await _chat_or_task(message, text)
 
@@ -733,48 +775,211 @@ async def notify(chat_id: int | str, text: str, reply_markup=None):
 # ---- chat vs task routing (added by final pass) ----
 import re as _re
 
-_TASK_RE = _re.compile(
-    r"\b(research|build|create|make|generate|write|code|develop|implement|deploy|"
-    r"analy[sz]e|scrape|crawl|download|summari[sz]e|translate|draw|design|compare|"
-    r"find|search|fix|debug|refactor|convert|plan|"
-    r"yarat|tuz|yoz|qil|top|tahlil|izla|yuklab|chiz|"
-    r"сделай|создай|напиши|найди|исследуй|разработай|проанализируй|сгенерируй|нарисуй)\b",
-    _re.I)
-_TASK_NOUNS = _re.compile(
-    r"\b(image|video|pdf|docx|excel|spreadsheet|website|app|script|report|file|"
-    r"rasm|sayt|ilova|fayl|hisobot|картинк|видео|сайт|приложени|файл|отчет|отчёт)\w*", _re.I)
 _FORCE_RE = _re.compile(r"^\s*(?:/task|task:|vazifa:|задача:)\s*(.+)$", _re.I | _re.S)
 _CHAT_HISTORY: dict = {}
 
+_IMAGE_GEN_RE = _re.compile(
+    r"(?:^/image|^/draw|^/imagine|\brasm\s+(?:chiz|yarat|qilib\s+ber)|\bsurat\s+chiz|"
+    r"\bнарисуй|\bсоздай\s+картинк|\bсгенерируй\s+(?:фото|картинк|изображени)|"
+    r"\bdraw\s+an?\s+image|\bgenerate\s+an?\s+image|\bcreate\s+an?\s+image|\bdraw\b|\bpaint\b)",
+    _re.I)
 
-def _looks_like_task(text: str) -> bool:
-    t = (text or "").strip()
-    if len(t) > 400:
-        return True
-    return bool(_TASK_RE.search(t) and (_TASK_NOUNS.search(t) or len(t.split()) >= 6)
-                and not _re.match(r"^(what|who|why|how|when|nima|qanday|nega|кто|что|как|почему)\b", t, _re.I))
+_VIDEO_GEN_RE = _re.compile(
+    r"(?:^/video|^/animate|\bvideo\s+(?:yarat|tayyorla|qilib\s+ber)|\brolik\s+yarat|"
+    r"\bсоздай\s+видео|\bсгенерируй\s+видео|"
+    r"\bgenerate\s+video|\bcreate\s+video|\bmake\s+a\s+video)",
+    _re.I)
+
+_WEBSITE_GEN_RE = _re.compile(
+    r"(?:^/web|^/website|^/site|\bsayt\s+(?:yarat|tuz|qilib\s+ber)|\bveb\s*sayt|\blanding\s+page|"
+    r"\bсоздай\s+сайт|\bсделай\s+сайт|\bнапиши\s+сайт|"
+    r"\bcreate\s+a?\s*website|\bbuild\s+a?\s*website|\bgenerate\s+a?\s*website|\bcreate\s+landing\s+page)",
+    _re.I)
+
+_PRESENTATION_GEN_RE = _re.compile(
+    r"(?:^/presentation|^/slides|^/ppt|\btaqdimot\s+(?:yarat|tayyorla|qilib\s+ber)|\bslayd\s+tayyorla|"
+    r"\bсоздай\s+презентаци|\bсделай\s+презентаци|"
+    r"\bcreate\s+a?\s*presentation|\bmake\s+a?\s*presentation|\bgenerate\s+slides)",
+    _re.I)
 
 
-async def _chat_or_task(message, text: str) -> None:
+async def handle_image_generation(message: Message, prompt: str):
+    clean_p = _IMAGE_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
+    status_msg = await message.answer(f"🎨 *\"{clean_p}\"*\n_Tasvir chizilmoqda, bir oz kuting..._", parse_mode="Markdown")
+    try:
+        from core.media_generator import generate_image
+        img_bytes = await generate_image(clean_p)
+        if not img_bytes:
+            await status_msg.edit_text("⚠️ Rasmni chizishda xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
+            return
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        caption = f"✨ *{clean_p}*\n_Agent tomonidan yaratildi (2026)_"
+        await message.answer_photo(
+            BufferedInputFile(img_bytes, filename="generated.jpg"),
+            caption=caption[:1000],
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.exception("Image gen failed: %s", e)
+        await status_msg.edit_text(f"⚠️ Rasm yaratishda xatolik: {str(e)[:150]}")
+
+
+async def handle_video_generation(message: Message, prompt: str):
+    clean_p = _VIDEO_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
+    status_msg = await message.answer(f"🎬 *\"{clean_p}\"*\n_Video render qilinmoqda, bir oz kuting..._", parse_mode="Markdown")
+    try:
+        from core.media_generator import generate_video
+        vid_bytes = await generate_video(clean_p)
+        if not vid_bytes:
+            await status_msg.edit_text("⚠️ Video render qilishda xatolik yuz berdi yoki servis band. Qayta urinib ko'ring.")
+            return
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        caption = f"🎬 *{clean_p}*"
+        await message.answer_video(
+            BufferedInputFile(vid_bytes, filename="video.mp4"),
+            caption=caption[:1000],
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.exception("Video gen failed: %s", e)
+        await status_msg.edit_text(f"⚠️ Video yaratishda xatolik: {str(e)[:150]}")
+
+
+async def handle_website_generation(message: Message, prompt: str):
+    clean_p = _WEBSITE_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
+    router = STATE.get("router")
+    if router is None:
+        await message.answer("⚠️ AI tizimi hali tayyor emas.")
+        return
+
+    status_msg = await message.answer(f"💻 *\"{clean_p}\"*\n_Mukammal veb-sayt (HTML5/Tailwind/JS) kodlanmoqda..._", parse_mode="Markdown")
+    try:
+        from core.media_generator import generate_website
+        html_code = await generate_website(clean_p, router)
+        if not html_code or len(html_code) < 100:
+            await status_msg.edit_text("⚠️ Veb-sayt kodini yaratib bo'lmadi.")
+            return
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        file_bytes = html_code.encode("utf-8")
+        caption = (
+            f"🚀 *Tayyor veb-sayt:* _{clean_p[:60]}_\n\n"
+            "✨ *Tarkibi:* Tailwind CSS, zamonaviy dizayn, interaktiv JavaScript va to'liq responsiv.\n"
+            "📥 Ushbu `.html` faylni istalgan brauzerda (Chrome, Safari) ochib ko'rishingiz mumkin!"
+        )
+        await message.answer_document(
+            BufferedInputFile(file_bytes, filename="index.html"),
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.exception("Website gen failed: %s", e)
+        await status_msg.edit_text(f"⚠️ Sayt yaratishda xatolik: {str(e)[:150]}")
+
+
+async def handle_presentation_generation(message: Message, prompt: str):
+    clean_p = _PRESENTATION_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
+    router = STATE.get("router")
+    if router is None:
+        await message.answer("⚠️ AI tizimi hali tayyor emas.")
+        return
+
+    status_msg = await message.answer(f"📊 *\"{clean_p}\"*\n_Interaktiv taqdimot slaydlari tayyorlanmoqda..._", parse_mode="Markdown")
+    try:
+        from core.media_generator import generate_presentation_html
+        pres_html = await generate_presentation_html(clean_p, router)
+        if not pres_html or len(pres_html) < 100:
+            await status_msg.edit_text("⚠️ Taqdimot yaratib bo'lmadi.")
+            return
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        file_bytes = pres_html.encode("utf-8")
+        caption = (
+            f"📊 *Interaktiv taqdimot:* _{clean_p[:60]}_\n\n"
+            "✨ *Xususiyatlari:* Reveal.js slaydlar, zamonaviy dizayn, animatsiyalar va tugmalar.\n"
+            "🖥️ Faylni brauzeringizda ochib, klaviatura strelkalari bilan boshqaring!"
+        )
+        await message.answer_document(
+            BufferedInputFile(file_bytes, filename="presentation.html"),
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.exception("Presentation gen failed: %s", e)
+        await status_msg.edit_text(f"⚠️ Taqdimot yaratishda xatolik: {str(e)[:150]}")
+
+
+async def _chat_or_task(message: Message, text: str) -> None:
+    # Explicit task command
     m = _FORCE_RE.match(text)
     if m:
         await _create_task_and_ack(message, m.group(1).strip())
         return
-    if _looks_like_task(text):
-        await _create_task_and_ack(message, text)
+
+    # Direct generative capabilities
+    if _IMAGE_GEN_RE.search(text):
+        await handle_image_generation(message, text)
         return
+
+    if _VIDEO_GEN_RE.search(text):
+        await handle_video_generation(message, text)
+        return
+
+    if _WEBSITE_GEN_RE.search(text):
+        await handle_website_generation(message, text)
+        return
+
+    if _PRESENTATION_GEN_RE.search(text):
+        await handle_presentation_generation(message, text)
+        return
+
+    # Direct conversational response
     await _chat_reply(message, text)
 
 
-_PERSONA = (
-    "Sen foydalanuvchining shaxsiy AI yordamchisisan (AgentOS). Do'stona, norasmiy va qisqa gapir: "
-    "foydalanuvchiga 'sen' deb murojaat qil, 'Sizga qanday yordam bera olaman?' kabi rasmiy iboralardan qoch. "
-    "Foydalanuvchi qaysi tilda yozsa (o'zbek, rus, ingliz) shu tilda, shunday norasmiy ohangda javob ber. "
-    "Sening doimiy xotirang bor: pastdagi 'Foydalanuvchi haqida bilganlaring' va oxirgi suhbat tarixi. "
-    "Hech qachon 'suhbatni eslab qolmayman' dema. Bilmagan narsangni o'ylab topma. "
-    "Agar foydalanuvchi haqiqiy ish so'rasa (sayt, rasm, taqdimot, kod, tadqiqot), uni aniq tasvirlashini ayt, "
-    "shunda sen buni vazifa sifatida ishga tushirasan."
-)
+def _get_current_persona(facts: list) -> str:
+    now = datetime.now()
+    curr_date = now.strftime("%Y-%m-%d, %A")
+    curr_time = now.strftime("%H:%M")
+    year = now.year  # 2026
+
+    p = (
+        f"Sen foydalanuvchining shaxsiy maslahatchisi, eng yaqin do'sti, shaxsiy kouchi (coach), "
+        f"visionary CEO, tajribali tadbirkor va polimat (polymath) AI sherigisan.\n\n"
+        f"📅 BUGUNGI REAL SANA VA VAQT: {curr_date}, {curr_time}. JORIY YIL: {year}-YIL.\n"
+        f"Sen 2026-yilning eng ilg'or dunyosida yashaysan va real vaqtdagi internet ma'lumotlariga to'liq egasan. "
+        f"Hech qachon 'mening bilimlarim 2023-yilgacha' yoki 'men faqat til modeliman' deb aytma!\n\n"
+        "👑 SENING OHANGING VA FAZILATLARING:\n"
+        "• Erkin, samimiy va do'stona gapir. Xuddi yaqin sirdosh do'sting va aqlli biznes-hamkoring bilan suhbatlashgandek.\n"
+        "• Quruq rasmiyatchilikni, 'Sizga qanday yordam bera olaman?' kabi sun'iy robotcha iboralarni BUTUNLAY unut.\n"
+        "• Polimat aql: texnologiya, dasturlash, biznes, startaplar, marketing, falsafa, psixologiya, dizayn va sog'lom fikrlashni birlashtir.\n"
+        "• Lider va CEO tafakkuri: o'tkir, strategik, dadil, amaliy va natijaga yo'naltirilgan bo'l.\n"
+        "• Foydalanuvchi qaysi tilda yozsa (o'zbek, rus, ingliz) o'sha tilda sof, tabiiy, zamonaviy va jonli so'zlash.\n"
+        "• Har qanday murakkab masalani eng yuqori saviyada, xatosiz, mukammal va professional darajada hal qilasan."
+    )
+    if facts:
+        p += "\n\n🧠 Foydalanuvchi haqida doimiy xotirang:\n" + "\n".join(f"- {f}" for f in facts)
+    return p
+
+
 _FACT_CUES = _re.compile(
     r"(mening|menga|ismim|yashayman|ishlayman|o'qiyman|yoqadi|eslab qol|esingda tut|"
     r"меня зовут|я живу|я работаю|люблю|запомни|my name|i am|i'm|i live|i work|i like|i love|remember)", _re.I)
@@ -845,9 +1050,10 @@ async def _extract_facts(router, tm, uid: str, text: str) -> None:
 
 
 _LIVE_SEARCH_CUES = _re.compile(
-    r"\b(bugun|hozir|yangilik|ob-havo|obhavo|kurs|dollar|narx|qidir|izla|top|"
-    r"today|news|weather|price|search|find|current|latest|"
-    r"сегодня|новости|погода|курс|доллар|цена|найди|поиск)\b", _re.I)
+    r"\b(bugun|hozir|yil|qaysi\s+yil|sana|vaqt|yangilik|ob-havo|obhavo|kurs|dollar|narx|qidir|izla|top|"
+    r"today|now|year|current\s+year|date|news|weather|price|search|find|latest|recent|who\s+is|what\s+happened|"
+    r"сегодня|сейчас|год|какой\s+год|новости|погода|курс|доллар|цена|найди|поиск|что\s+произошло)\b",
+    _re.I)
 
 
 async def _stream_and_render_reply(
@@ -968,17 +1174,15 @@ async def _chat_reply(
     facts = await _load_profile(pool, uid) if pool else []
     hist = await _load_history(pool, uid, message.chat.id) if pool else _CHAT_HISTORY.setdefault(message.chat.id, [])[-10:]
 
-    system = _PERSONA + "\n\nFoydalanuvchi haqida bilganlaring:\n" + (
-        "\n".join("- " + f for f in facts) if facts else "(hozircha hech narsa)")
+    system = _get_current_persona(facts)
 
-    # Smart auto-search if query asks for current info
-    if _LIVE_SEARCH_CUES.search(text) and len(text.split()) >= 2:
+    # Smart auto-search if query asks for current info, dates, news, or facts
+    if _LIVE_SEARCH_CUES.search(text):
         try:
-            from core.web_research import search_web
-            s_res = search_web(text[:100], max_results=3)
-            if s_res.get("results"):
-                snippets = "\n".join(f"- {r['title']}: {r['snippet']}" for r in s_res["results"])
-                system += f"\n\nJonli internet ma'lumotlari:\n{snippets}"
+            from core.web_research import research
+            web_info = research(text[:120], max_results=4)
+            if web_info:
+                system += f"\n\n{web_info}\n\nEslatma: Yuqoridagi jonli internet ma'lumotlariga tayanib eng yangi, aniq va to'g'ri javobni ber."
         except Exception as ex:
             log.debug("Auto search failed: %s", ex)
 
@@ -1020,8 +1224,7 @@ async def _multimodal_chat_reply(
     pool = getattr(tm, "pool", None)
     uid = _uid(message)
     facts = await _load_profile(pool, uid) if pool else []
-    system = _PERSONA + "\n\nFoydalanuvchi haqida bilganlaring:\n" + (
-        "\n".join("- " + f for f in facts) if facts else "(hozircha hech narsa)")
+    system = _get_current_persona(facts)
 
     msgs = [
         {"role": "system", "content": system},
