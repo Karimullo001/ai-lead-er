@@ -2413,3 +2413,15 @@ export OPENAI_API_KEY=sk-...
 pytest -q
 python -m demo.run
 uvicorn api.main:app --reload
+'''
+
+
+from pathlib import Path as _Path
+_target = _Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+_target.mkdir(parents=True, exist_ok=True)
+for _rel, _content in FILES.items():
+    _p = _target / _rel
+    if not _p.exists():
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        _p.write_text(_content, encoding="utf-8")
+print(f"AgentOS generated: {len(FILES)} files -> {_target}")

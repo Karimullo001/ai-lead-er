@@ -1,223 +1,238 @@
-"""Embedded AgentOS runtime for Free Render.
-
-The API must bind its port even if worker/Telegram initialization is slow.
-All heavy imports and connections therefore happen in background tasks.
-"""
 from __future__ import annotations
-
 import asyncio
 import logging
 import os
-from typing import Any
-from concurrent.futures import ThreadPoolExecutor
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+from core.worker import Worker
+from core.model_router import ModelRouter
+from telegram_bot.handlers import router, STATE
+from telegram_bot.security import AuthMiddleware
+from telegram_bot.notifier import get_notifier
+from telegram_bot.bot import _status_notifier_loop
 
 log = logging.getLogger("agentos.hosted")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+_runtime = {}
 
-
-async def _telegram_runtime(ready_event: asyncio.Event | None = None) -> None:
-    from aiogram import Bot, Dispatcher
-    from aiogram.client.default import DefaultBotProperties
-    from aiogram.enums import ParseMode
-    from core.approval import ApprovalGate
-    from core.comm_bus import CommunicationBus
-    from core.events import EventStore
-    from core.factory import AgentFactory
-    from core.llm import LLMClient
-    from core.model_router import ModelRouter
-    from core.orchestrator import Orchestrator
-    from core.queue import TaskQueue
-    from core.reliability import ReliabilityEngine
-    from core.task_manager import TaskManager
-    from core.tools import Sandbox, ToolRegistry
-    from demo.agents import build_demo_specs, register_demo_tools
-    from telegram_bot.handlers import STATE, router
-    from telegram_bot.bot import _status_notifier_loop
-    from telegram_bot.security import AuthMiddleware
-
+async def _telegram_loop(tm, queue, router_model, orch):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         log.warning("TELEGRAM_BOT_TOKEN missing; Telegram disabled")
         return
+    delay = 2.0
+    while not _runtime.get("stopping"):
+        bot = None
+        notif_task = None
+        notifier = get_notifier()
+        try:
+            if notifier._bot is None:
+                await notifier.start()
+            bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+            await bot.delete_webhook(drop_pending_updates=False)
+            me = await bot.get_me()
+            STATE.update(dict(tm=tm, queue=queue, router=router_model,
+                              orch=orch, notifier=notifier, bot=bot))
+            dp = Dispatcher()
+            dp.message.middleware(AuthMiddleware())
+            dp.callback_query.middleware(AuthMiddleware())
+            dp.include_router(router)
+            notif_task = asyncio.create_task(_status_notifier_loop(tm, notifier))
+            _runtime["telegram_ready"] = True
+            log.info("Telegram bot connected as @%s", me.username)
+            delay = 2.0
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                handle_signals=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _runtime["telegram_ready"] = False
+            log.warning("Telegram polling attempt failed; retrying in %.1fs: %s",
+                        delay, exc)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2.0, 30.0)
+        finally:
+            if notif_task:
+                notif_task.cancel()
+                try:
+                    await notif_task
+                except asyncio.CancelledError:
+                    pass
+            if bot:
+                try:
+                    await bot.session.close()
+                except Exception:
+                    pass
 
-    log.info("Telegram runtime: token configured; connecting to Postgres")
-    dsn = os.environ["DATABASE_URL"]
-    redis_url = os.environ["REDIS_URL"]
+async def start_hosted_runtime():
+    _runtime.clear()
+    _runtime["stopping"] = False
+    _runtime["telegram_ready"] = False
 
-    tm = TaskManager(dsn)
-    await tm.connect()
-    log.info("Telegram runtime: Postgres connected")
-    queue = TaskQueue(redis_url, consumer_name="api-hosted-telegram")
-    await queue.connect()
-    log.info("Telegram runtime: Redis connected")
-
-    log.info("Telegram runtime: building handler dependencies")
-    tools = ToolRegistry()
-    register_demo_tools(tools)
-    events = EventStore(dsn=dsn)
-    await events.connect()
-    log.info("Telegram runtime: EventStore connected")
-    comm = CommunicationBus()
-    router_model = ModelRouter()
-    log.info("Telegram runtime: ModelRouter ready")
-    llm = LLMClient(router=router_model)
-    approval = ApprovalGate(
-        auto_approve_in_dev=os.getenv("AUTO_APPROVE", "false").lower() == "true"
-    )
-    factory = AgentFactory(
-        llm=llm,
-        tools=tools,
-        event_store=events,
-        comm_bus=comm,
-        reliability=ReliabilityEngine(),
-        approval_gate=approval,
-        sandbox=Sandbox(prefer_docker=False),
-    )
-    orch = Orchestrator(events, comm)
-    log.info("Telegram runtime: registering handler agents")
-    for spec in build_demo_specs():
-        orch.register_agent(factory.build(spec))
-    log.info("Telegram runtime: handler agents ready")
-
-    class LazyNotifier:
-        def __init__(self, bot_token: str):
-            self.token = bot_token
-            self.bot = None
-
-        async def start(self):
-            return None
-
-        async def stop(self):
-            if self.bot:
-                await self.bot.session.close()
-                self.bot = None
-
-        async def send(self, chat_id, text, reply_markup=None):
-            if self.bot is None:
-                self.bot = Bot(self.token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-            try:
-                await self.bot.send_message(int(chat_id), text[:4000], reply_markup=reply_markup)
-            except Exception:
-                log.exception("Telegram notification send failed")
-
-    notifier = LazyNotifier(token)
-    log.info("Telegram runtime: lazy notifier ready")
-    STATE.update(
-        tm=tm, queue=queue, router=router_model, orch=orch,
-        approval=approval, notifier=notifier, redis_url=redis_url
-    )
-    # Hosted mode must run the terminal-task notifier too. The standalone
-    # telegram bot normally starts this loop, but embedded mode bypasses bot.py.
-    status_notifier_task = asyncio.create_task(
-        _status_notifier_loop(tm, notifier), name="agentos-status-notifier"
-    )
-
-    log.info("Telegram runtime: creating polling bot")
-    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-    dp = Dispatcher()
-    dp.message.middleware(AuthMiddleware())
-    dp.callback_query.middleware(AuthMiddleware())
-    dp.include_router(router)
-    log.info("Telegram runtime: dispatcher ready")
-    log.info("Telegram polling starting")
-    try:
-        me = await bot.get_me()
-        log.info("Telegram bot connected as @%s", me.username or me.id)
-        if ready_event is not None:
-            ready_event.set()
-            log.info("Telegram runtime ready; worker startup may begin")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Telegram polling stopped with an error")
-    finally:
-        status_notifier_task.cancel()
-        await asyncio.gather(status_notifier_task, return_exceptions=True)
-        await notifier.stop()
-        await bot.session.close()
-        await queue.close()
-        await tm.close()
-        log.info("Telegram runtime stopped")
-
-
-def _worker_thread_entry() -> None:
-    """Run the worker on its own event loop so a blocking worker loop cannot starve Telegram."""
-    asyncio.run(_worker_runtime())
-
-
-async def _worker_runtime() -> None:
-    from core.worker import Worker
-
-    worker = Worker(name="api-hosted-worker")
+    worker = Worker("api-hosted-worker")
     await worker.setup()
-    log.info("Embedded worker initialized")
-    try:
-        await worker.loop()
-    except asyncio.CancelledError:
-        raise
-    finally:
+    assert worker.tm and worker.queue and worker.orch
+
+    STATE.update(dict(
+        tm=worker.tm,
+        queue=worker.queue,
+        router=ModelRouter(),
+        orch=worker.orch,
+    ))
+
+    worker_task = asyncio.create_task(worker.loop())
+    telegram_task = asyncio.create_task(
+        _telegram_loop(worker.tm, worker.queue, STATE["router"], worker.orch)
+    )
+    _runtime.update(
+        worker=worker,
+        worker_task=worker_task,
+        telegram_task=telegram_task,
+        tm=worker.tm,
+        queue=worker.queue,
+    )
+    return _runtime
+
+async def stop_hosted_runtime(state):
+    state["stopping"] = True
+    tg = state.get("telegram_task")
+    if tg:
+        tg.cancel()
+        try:
+            await tg
+        except asyncio.CancelledError:
+            pass
+    wt = state.get("worker_task")
+    if wt:
+        wt.cancel()
+        try:
+            await wt
+        except asyncio.CancelledError:
+            pass
+    worker = state.get("worker")
+    if worker:
         try:
             await worker.shutdown()
         except Exception:
-            log.exception("Embedded worker shutdown failed")
+            log.exception("worker shutdown failed")
 
+# AgentOS webhook runtime patch
+import hashlib as _agentos_hashlib
+from aiogram.types import Update as _AgentOSUpdate
 
-async def _supervisor(worker_executor: ThreadPoolExecutor) -> None:
-    log.info("Hosted runtime supervisor starting")
-
-    # Fully initialize Telegram before starting the worker. Worker startup can
-    # import heavy modules and trigger model/cache downloads; starting it too
-    # early can delay Telegram initialization on a single Free Render instance.
-    telegram_ready = asyncio.Event()
-    telegram_task = asyncio.create_task(
-        _telegram_runtime(telegram_ready), name="agentos-telegram-embedded"
-    )
-
-    try:
-        await asyncio.wait_for(telegram_ready.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        log.error("Telegram did not become ready within 30s; worker startup continues")
-
-    worker_task = asyncio.get_running_loop().run_in_executor(
-        worker_executor, _worker_thread_entry
-    )
-
-    tasks = [telegram_task, worker_task]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for name, result in zip(("telegram", "worker"), results):
-        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-            log.error("Hosted %s task crashed: %r", name, result)
-        else:
-            log.warning("Hosted %s task exited", name)
-
-
-async def start_hosted_runtime() -> dict[str, Any]:
-    worker_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentos-worker")
-    supervisor = asyncio.create_task(_supervisor(worker_executor), name="agentos-hosted-supervisor")
-    supervisor.add_done_callback(_report_supervisor)
-    log.info("AgentOS hosted supervisor launched")
-    return {"supervisor_task": supervisor, "worker_executor": worker_executor}
-
-
-def _report_supervisor(task: asyncio.Task) -> None:
-    if task.cancelled():
-        log.info("Hosted runtime supervisor cancelled")
+async def _telegram_loop(tm, queue, router_model, orch):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        log.warning("TELEGRAM_BOT_TOKEN missing; Telegram disabled")
         return
-    exc = task.exception()
-    if exc:
-        log.error("Hosted runtime supervisor crashed", exc_info=exc)
-    else:
-        log.warning("Hosted runtime supervisor exited")
+    notifier = get_notifier()
+    bot = None
+    notif_task = None
+    try:
+        if notifier._bot is None:
+            await notifier.start()
+        bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+        STATE.update(dict(tm=tm, queue=queue, router=router_model, orch=orch,
+                          notifier=notifier, bot=bot))
+        dp = Dispatcher()
+        dp.message.middleware(AuthMiddleware())
+        dp.callback_query.middleware(AuthMiddleware())
+        dp.include_router(router)
+        _runtime["bot"] = bot
+        _runtime["dispatcher"] = dp
+        external = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+        if external:
+            secret = _agentos_hashlib.sha256(token.encode()).hexdigest()
+            webhook = external + "/telegram/webhook"
+            await bot.set_webhook(
+                webhook,
+                secret_token=secret,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=False,
+            )
+            _runtime["telegram_ready"] = True
+            _runtime["webhook_owner_url"] = webhook
+            log.info("Telegram webhook connected at %s", webhook)
+            notif_task = asyncio.create_task(_status_notifier_loop(tm, notifier))
+            while not _runtime.get("stopping"):
+                await asyncio.sleep(5)
+        else:
+            # Local fallback: keep the existing polling behavior.
+            await bot.delete_webhook(drop_pending_updates=False)
+            _runtime["telegram_ready"] = True
+            notif_task = asyncio.create_task(_status_notifier_loop(tm, notifier))
+            await dp.start_polling(
+                bot, allowed_updates=dp.resolve_used_update_types(),
+                handle_signals=False,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _runtime["telegram_ready"] = False
+        log.exception("Telegram runtime failed: %s", exc)
+    finally:
+        if notif_task:
+            notif_task.cancel()
+            try:
+                await notif_task
+            except asyncio.CancelledError:
+                pass
+        if bot:
+            # Only the instance that currently owns the webhook may delete it.
+            # This prevents an old Render instance during a rolling deploy from
+            # deleting the webhook belonging to the new instance.
+            try:
+                info = await bot.get_webhook_info()
+                current_url = getattr(info, "url", "") or ""
+                owned_url = _runtime.get("webhook_owner_url")
+                if owned_url and current_url == owned_url:
+                    await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
 
+_telegram_seen_updates: set[int] = set()
+_telegram_seen_order: list[int] = []
 
-async def stop_hosted_runtime(runtime: dict[str, Any]) -> None:
-    task = runtime.get("supervisor_task")
-    if task:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-    executor = runtime.get("worker_executor")
-    if executor:
-        executor.shutdown(wait=False, cancel_futures=True)
-    log.info("Hosted runtime stopped")
+async def handle_telegram_webhook(payload: dict, secret_header: str | None = None):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    log.info("Telegram webhook request received: has_secret=%s payload_keys=%s", bool(secret_header), sorted(payload.keys()) if isinstance(payload, dict) else [])
+    if not token or not secret_header:
+        log.warning("Telegram webhook rejected: missing token or secret header")
+        return False
+    expected = _agentos_hashlib.sha256(token.encode()).hexdigest()
+    if secret_header != expected:
+        log.warning("Telegram webhook rejected: invalid secret header")
+        return False
+    dp = _runtime.get("dispatcher")
+    bot = _runtime.get("bot")
+    if not dp or not bot:
+        log.warning("Telegram webhook rejected: dispatcher/bot not ready")
+        return False
+    try:
+        update = _AgentOSUpdate.model_validate(payload)
+        # Telegram may retry a webhook delivery if processing is slow. Never
+        # execute the same update twice.
+        update_id = int(update.update_id)
+        if update_id in _telegram_seen_updates:
+            log.info("Telegram duplicate update ignored: %s", update_id)
+            return True
+        _telegram_seen_updates.add(update_id)
+        _telegram_seen_order.append(update_id)
+        if len(_telegram_seen_order) > 1000:
+            old_id = _telegram_seen_order.pop(0)
+            _telegram_seen_updates.discard(old_id)
+        await dp.feed_update(bot, update)
+        log.info("Telegram webhook update processed: %s", update_id)
+        return True
+    except Exception:
+        log.exception("Telegram webhook update processing failed")
+        return False

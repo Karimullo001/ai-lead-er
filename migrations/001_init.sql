@@ -1,0 +1,7 @@
+-- Auto-applied by core.task_manager.TaskManager.connect().
+-- This file exists for reference and manual migrations.
+--
+-- Tables: tasks, task_checkpoints, task_events, scheduled_jobs,
+--         user_settings, audit_log, heartbeats
+--
+-- See core/task_manager.py :: SCHEMA for the authoritative DDL.

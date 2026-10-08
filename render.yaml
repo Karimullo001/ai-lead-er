@@ -3,7 +3,7 @@ services:
     name: agentos-api-v2
     runtime: python
     plan: free
-    buildCommand: python repair_bootstrap.py && python bootstrap_agentos.py . && python upgrade_agentos.py && python enhance_agentos.py && python patch_single_service.py && python finish_agentos.py && pip install -e .
+    buildCommand: pip install -e .
     startCommand: python hosted_start.py
     envVars:
       - key: DATABASE_URL
@@ -18,6 +18,8 @@ services:
       - key: EMBEDDED_RUNTIME
         value: "true"
       - key: AGENTOS_API_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
         sync: false
       - key: OPENAI_API_KEY
         sync: false
