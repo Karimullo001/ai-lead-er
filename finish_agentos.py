@@ -994,3 +994,51 @@ uvicorn.run(
     log_level=os.getenv("LOG_LEVEL", "info"),
 )
 ''', encoding="utf-8")
+
+
+# ---------------------------------------------------------------------
+# Final guard: make sure generated modules import every stdlib module they
+# use. Earlier patch passes insert code that references asyncio/json/uuid
+# without always adding the import (this caused NameError crashes in the
+# Telegram task handler and the worker). Idempotent.
+# ---------------------------------------------------------------------
+import re as _re_guard
+_NEEDS = {
+    "telegram_bot/handlers.py": ("asyncio", "json", "mimetypes", "tempfile"),
+    "telegram_bot/bot.py": ("asyncio", "json"),
+    "core/worker.py": ("asyncio", "json", "uuid"),
+}
+for _rel, _mods in _NEEDS.items():
+    _p = ROOT / _rel
+    if not _p.exists():
+        continue
+    _src = _p.read_text(encoding="utf-8")
+    _missing = []
+    for _m in _mods:
+        _uses = _re_guard.search(r"\b" + _m + r"\.", _src)
+        _has = _re_guard.search(r"^\s*import\s+[^\n]*\b" + _m + r"\b", _src, _re_guard.M)
+        if _uses and not _has:
+            _missing.append(_m)
+    if _missing:
+        _line = "import " + ", ".join(_missing) + "\n"
+        _fut = "from __future__ import annotations\n"
+        if _src.startswith(_fut):
+            _src = _fut + _line + _src[len(_fut):]
+        else:
+            _src = _line + _src
+        _p.write_text(_src, encoding="utf-8")
+        print("AgentOS import guard: added", _missing, "to", _rel)
+
+
+# The worker's task-summary memory write uses `original_description`, but an
+# earlier patch pass renamed the variable it was defined in, so the write
+# silently failed (NameError swallowed by `except Exception`). Define it.
+_wp = ROOT / "core/worker.py"
+if _wp.exists():
+    _w = _wp.read_text(encoding="utf-8")
+    _anchor = '        description=row["description"]\n'
+    if "original_description" in _w and "original_description =" not in _w \
+            and "original_description=" not in _w and _anchor in _w:
+        _w = _w.replace(_anchor, '        original_description = row["description"]\n' + _anchor, 1)
+        _wp.write_text(_w, encoding="utf-8")
+        print("AgentOS import guard: defined original_description in core/worker.py")

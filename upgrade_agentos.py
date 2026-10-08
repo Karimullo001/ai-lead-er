@@ -1738,7 +1738,7 @@ def confirm_kb(action: str, token: str) -> InlineKeyboardMarkup:
 # telegram_bot/handlers.py
 # =====================================================================
 FILES["telegram_bot/handlers.py"] = r'''from __future__ import annotations
-import logging, os, time
+import asyncio, json, logging, os, time
 from typing import Any, Dict, Optional
 from aiogram import Router, F
 from aiogram.filters import Command, CommandStart, CommandObject
