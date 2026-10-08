@@ -1042,3 +1042,71 @@ if _wp.exists():
         _w = _w.replace(_anchor, '        original_description = row["description"]\n' + _anchor, 1)
         _wp.write_text(_w, encoding="utf-8")
         print("AgentOS import guard: defined original_description in core/worker.py")
+
+
+# ---------------------------------------------------------------------
+# Worker loop fix: an earlier patch left the ORIGINAL claim at the top of
+# the loop in front of the new lock-then-claim logic. Every task was claimed
+# once at the top and then abandoned when the loop claimed again, so queued
+# tasks never ran and the queue only logged "Reclaimed abandoned message".
+# Keep a single claim (lock first, then claim), and send queue entries older
+# than 12h to the DLQ instead of replaying stale work after an outage.
+# ---------------------------------------------------------------------
+_wp = ROOT / "core/worker.py"
+if _wp.exists():
+    _w = _wp.read_text(encoding="utf-8")
+    _old_top = (
+        "        while not self.stop.is_set():\n"
+        "            try:\n"
+        "                msg = await self.queue.claim_one(block_ms=3000)\n"
+        "            except Exception as e:\n"
+        "                log.error(\"Queue read failed: %s\", e)\n"
+        "                await asyncio.sleep(2)\n"
+        "                continue\n"
+        "            if not msg:\n"
+        "                continue\n"
+        "            entry_id = msg[\"entry_id\"]\n"
+        "            task_id = msg[\"data\"].get(\"task_id\")\n"
+        "            if not task_id:\n"
+        "                await self.queue.to_dlq(entry_id, \"?\", \"missing task_id\")\n"
+        "                continue\n"
+        "            owner = f\"{self.name}:{uuid.uuid4().hex}\"\n"
+    )
+    _new_top = (
+        "        while not self.stop.is_set():\n"
+        "            owner = f\"{self.name}:{uuid.uuid4().hex}\"\n"
+    )
+    if _old_top in _w:
+        _w = _w.replace(_old_top, _new_top, 1)
+        _anchor = (
+            "                    continue\n\n"
+            "                async def _refresh_lock():\n"
+        )
+        _stale = (
+            "                    continue\n\n"
+            "                try:\n"
+            "                    _age_h = (time.time() * 1000 - int(str(entry_id).split(\"-\")[0])) / 3_600_000\n"
+            "                except Exception:\n"
+            "                    _age_h = 0\n"
+            "                if _age_h > 12:\n"
+            "                    log.warning(\"Dropping stale queue entry %s (%.1fh old)\", entry_id, _age_h)\n"
+            "                    await self.queue.to_dlq(entry_id, task_id, \"stale queue entry (>12h)\")\n"
+            "                    continue\n\n"
+            "                async def _refresh_lock():\n"
+        )
+        assert _anchor in _w, "worker anchor missing"
+        _w = _w.replace(_anchor, _stale, 1)
+        _wp.write_text(_w, encoding="utf-8")
+        print("AgentOS worker fix: single claim per loop + stale-entry DLQ")
+    else:
+        print("AgentOS worker fix: top-of-loop claim not found (already fixed?)")
+
+# Telegram messages were sent with a literal backslash-n instead of a newline.
+_hp = ROOT / "telegram_bot/handlers.py"
+if _hp.exists():
+    _h = _hp.read_text(encoding="utf-8")
+    _bs = chr(92)
+    if (_bs * 2 + "n") in _h:
+        _h = _h.replace(_bs * 2 + "n", _bs + "n")
+        _hp.write_text(_h, encoding="utf-8")
+        print("AgentOS Telegram fix: literal \\\\n -> newline in handler messages")
