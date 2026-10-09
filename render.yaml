@@ -37,6 +37,16 @@ services:
         sync: false
       - key: TELEGRAM_ALLOWED_USER_IDS
         sync: false
+      - key: REPLICATE_API_TOKEN
+        sync: false
+      - key: LUMA_API_KEY
+        sync: false
+      - key: CANVA_API_KEY
+        sync: false
+      - key: FIGMA_ACCESS_TOKEN
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
 
   - type: keyvalue
     name: agentos-redis

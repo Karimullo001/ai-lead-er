@@ -121,9 +121,23 @@ async def stop_hosted_runtime(state):
         except Exception:
             log.exception("worker shutdown failed")
 
-# AgentOS webhook runtime patch
 import hashlib as _agentos_hashlib
 from aiogram.types import Update as _AgentOSUpdate
+import httpx
+
+async def _render_keep_alive_loop(external_url: str):
+    """Keep-alive ping loop to prevent Render free instance from sleeping."""
+    url = f"{external_url.rstrip('/')}/healthz"
+    log.info("Starting Render keep-alive pinger for: %s", url)
+    await asyncio.sleep(60)  # Initial wait after startup
+    while not _runtime.get("stopping"):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(url)
+                log.debug("Keep-alive ping to %s status: %d", url, r.status_code)
+        except Exception as e:
+            log.debug("Keep-alive ping notice: %s", e)
+        await asyncio.sleep(480)  # Ping every 8 minutes (Render sleeps after 15 mins)
 
 async def _telegram_loop(tm, queue, router_model, orch):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -133,6 +147,7 @@ async def _telegram_loop(tm, queue, router_model, orch):
     notifier = get_notifier()
     bot = None
     notif_task = None
+    keep_alive_task = None
     try:
         if notifier._bot is None:
             await notifier.start()
@@ -159,6 +174,7 @@ async def _telegram_loop(tm, queue, router_model, orch):
             _runtime["webhook_owner_url"] = webhook
             log.info("Telegram webhook connected at %s", webhook)
             notif_task = asyncio.create_task(_status_notifier_loop(tm, notifier))
+            keep_alive_task = asyncio.create_task(_render_keep_alive_loop(external))
             while not _runtime.get("stopping"):
                 await asyncio.sleep(5)
         else:
@@ -176,6 +192,8 @@ async def _telegram_loop(tm, queue, router_model, orch):
         _runtime["telegram_ready"] = False
         log.exception("Telegram runtime failed: %s", exc)
     finally:
+        if keep_alive_task:
+            keep_alive_task.cancel()
         if notif_task:
             notif_task.cancel()
             try:
@@ -183,9 +201,6 @@ async def _telegram_loop(tm, queue, router_model, orch):
             except asyncio.CancelledError:
                 pass
         if bot:
-            # Only the instance that currently owns the webhook may delete it.
-            # This prevents an old Render instance during a rolling deploy from
-            # deleting the webhook belonging to the new instance.
             try:
                 info = await bot.get_webhook_info()
                 current_url = getattr(info, "url", "") or ""
@@ -204,7 +219,6 @@ _telegram_seen_order: list[int] = []
 
 async def handle_telegram_webhook(payload: dict, secret_header: str | None = None):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    log.info("Telegram webhook request received: has_secret=%s payload_keys=%s", bool(secret_header), sorted(payload.keys()) if isinstance(payload, dict) else [])
     if not token or not secret_header:
         log.warning("Telegram webhook rejected: missing token or secret header")
         return False
@@ -219,8 +233,6 @@ async def handle_telegram_webhook(payload: dict, secret_header: str | None = Non
         return False
     try:
         update = _AgentOSUpdate.model_validate(payload)
-        # Telegram may retry a webhook delivery if processing is slow. Never
-        # execute the same update twice.
         update_id = int(update.update_id)
         if update_id in _telegram_seen_updates:
             log.info("Telegram duplicate update ignored: %s", update_id)
@@ -230,8 +242,11 @@ async def handle_telegram_webhook(payload: dict, secret_header: str | None = Non
         if len(_telegram_seen_order) > 1000:
             old_id = _telegram_seen_order.pop(0)
             _telegram_seen_updates.discard(old_id)
-        await dp.feed_update(bot, update)
-        log.info("Telegram webhook update processed: %s", update_id)
+
+        # CRITICAL FIX: Run feed_update in background task so webhook responds HTTP 200 immediately
+        # within 5ms to Telegram. This prevents Telegram webhook timeouts and stops freezing!
+        asyncio.create_task(dp.feed_update(bot, update))
+        log.info("Telegram webhook update %s dispatched immediately in background", update_id)
         return True
     except Exception:
         log.exception("Telegram webhook update processing failed")

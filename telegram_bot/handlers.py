@@ -831,15 +831,19 @@ _FORCE_RE = _re.compile(r"^\s*(?:/task|task:|vazifa:|задача:)\s*(.+)$", _r
 _CHAT_HISTORY: dict = {}
 
 _IMAGE_GEN_RE = _re.compile(
-    r"(?:^/image|^/draw|^/imagine|\brasm\s+(?:chiz|yarat|qilib\s+ber)|\bsurat\s+chiz|"
-    r"\bнарисуй|\bсоздай\s+картинк|\bсгенерируй\s+(?:фото|картинк|изображени)|"
-    r"\bdraw\s+an?\s+image|\bgenerate\s+an?\s+image|\bcreate\s+an?\s+image|\bdraw\b|\bpaint\b)",
+    r"(?:^/image|^/draw|^/imagine|"
+    r"(?:\brasm\b|\bsurat\b|\btasvir\b|\bimage\b|\bpicture\b|\bphoto\b|\bкартинк|\bизображени|\bрисун)"
+    r".*?(?:\bchiz|\byarat|\bqilib\s+ber|\byasa|\bkerak|\bdraw|\bpaint|\bgenerate|\bcreate|\bmake|\bнарисуй|\bсоздай|\bсгенерируй)|"
+    r"(?:\bchiz|\byarat|\bqilib\s+ber|\bdraw|\bpaint|\bgenerate|\bcreate|\bнарисуй|\bсоздай|\bсгенерируй)"
+    r".*?(?:\brasm\b|\bsurat\b|\btasvir\b|\bimage\b|\bpicture\b|\bphoto\b|\bкартинк|\bизображени|\bрисун))",
     _re.I)
 
 _VIDEO_GEN_RE = _re.compile(
-    r"(?:^/video|^/animate|\bvideo\s+(?:yarat|tayyorla|qilib\s+ber)|\brolik\s+yarat|"
-    r"\bсоздай\s+видео|\bсгенерируй\s+видео|"
-    r"\bgenerate\s+video|\bcreate\s+video|\bmake\s+a\s+video)",
+    r"(?:^/video|^/animate|"
+    r"(?:\bvideo\b|\brolik\b|\bklip\b|\bclip\b|\bвидео\b|\bролик\b)"
+    r".*?(?:\byarat|\btayyorla|\bqilib\s+ber|\byasa|\bkerak|\bcreate|\bgenerate|\bmake|\brender|\bсоздай|\bсделай|\bсгенерируй)|"
+    r"(?:\byarat|\btayyorla|\bqilib\s+ber|\bcreate|\bgenerate|\bmake|\brender|\bсоздай|\bсделай|\bсгенерируй)"
+    r".*?(?:\bvideo\b|\brolik\b|\bklip\b|\bclip\b|\bвидео\b|\bролик\b))",
     _re.I)
 
 _FULLSTACK_GEN_RE = _re.compile(
@@ -849,19 +853,23 @@ _FULLSTACK_GEN_RE = _re.compile(
     _re.I)
 
 _WEBSITE_GEN_RE = _re.compile(
-    r"(?:^/web|^/website|^/site|\bsayt\s+(?:yarat|tuz|qilib\s+ber)|\bveb\s*sayt|\blanding\s+page|"
-    r"\bсоздай\s+сайт|\bсделай\s+сайт|\bнапиши\s+сайт|"
-    r"\bcreate\s+a?\s*website|\bbuild\s+a?\s*website|\bgenerate\s+a?\s*website|\bcreate\s+landing\s+page)",
+    r"(?:^/web|^/website|^/site|"
+    r"(?:\bsayt\b|\bveb\s*sayt\b|\bwebsite\b|\bweb\s*page\b|\blanding\s+page\b|\bсайт\b|\bлендинг\b)"
+    r".*?(?:\byarat|\btuz|\byasab\s+ber|\bqilib\s+ber|\byasa|\bkerak|\bcreate|\bbuild|\bmake|\bdesign|\bgenerate|\bсоздай|\bсделай|\bнапиши)|"
+    r"(?:\byarat|\btuz|\byasab\s+ber|\bqilib\s+ber|\bcreate|\bbuild|\bmake|\bdesign|\bgenerate|\bсоздай|\bсделай|\bнапиши)"
+    r".*?(?:\bsayt\b|\bveb\s*sayt\b|\bwebsite\b|\bweb\s*page\b|\blanding\s+page\b|\bсайт\b|\bлендинг\b))",
     _re.I)
 
 _PRESENTATION_GEN_RE = _re.compile(
-    r"(?:^/presentation|^/slides|^/ppt|\btaqdimot\s+(?:yarat|tayyorla|qilib\s+ber)|\bslayd\s+tayyorla|"
-    r"\bсоздай\s+презентаци|\bсделай\s+презентаци|"
-    r"\bcreate\s+a?\s*presentation|\bmake\s+a?\s*presentation|\bgenerate\s+slides)",
+    r"(?:^/presentation|^/slides|^/ppt|"
+    r"(?:\btaqdimot\b|\bslayd\b|\bslaydlar\b|\bpresentation\b|\bslides\b|\bпрезентаци|\bслайд)"
+    r".*?(?:\byarat|\btayyorla|\bqilib\s+ber|\byasa|\bkerak|\bcreate|\bmake|\bgenerate|\bсоздай|\bсделай)|"
+    r"(?:\byarat|\btayyorla|\bqilib\s+ber|\bcreate|\bmake|\bgenerate|\bсоздай|\bсделай)"
+    r".*?(?:\btaqdimot\b|\bslayd\b|\bslaydlar\b|\bpresentation\b|\bslides\b|\bпрезентаци|\bслайд))",
     _re.I)
 
 _PLUGINS_RE = _re.compile(
-    r"(?:^/plugins|^/integrations|\bplaginlar|\bintegratsiyalar|\bulangan\s+servislar|\bconnectors)",
+    r"(?:^/plugins|^/integrations|\bplaginlar|\bintegratsiyalar|\bulangan\s+servislar|\bconnectors|\bcanva\b|\bfigma\b)",
     _re.I)
 
 _GITHUB_ACTION_RE = _re.compile(
@@ -869,14 +877,24 @@ _GITHUB_ACTION_RE = _re.compile(
     _re.I)
 
 
+def _clean_natural_prompt(text: str) -> str:
+    """Extract clean subject from natural language commands."""
+    t = text.strip()
+    # Remove common conversational prefixes
+    t = _re.sub(r"^(?:iltimos|menga|bizga|ser|jarvis|hey|can\s+you|please|пожалуйста|создай|сделай|нарисуй|yarat|chiz|yasab\s+ber|tayyorlab\s+ber)\s+", "", t, flags=_re.I)
+    t = _re.sub(r"^(?:bitta|bir|one|an?)\s+", "", t, flags=_re.I)
+    t = _re.sub(r"\s+(?:yaratib\s+ber|qilib\s+ber|yasab\s+ber|kerak|tayyorla|chizib\s+ber|kerak edi)$", "", t, flags=_re.I)
+    return t.strip(" :,-") or text.strip()
+
+
 async def handle_image_generation(message: Message, prompt: str):
-    clean_p = _IMAGE_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
-    status_msg = await message.answer(f"🎨 *\"{clean_p}\"*\n_Tasvir chizilmoqda (Google Imagen / DALL-E / Flux)..._", parse_mode="Markdown")
+    clean_p = _clean_natural_prompt(prompt)
+    status_msg = await message.answer(f"🎨 *JARVIS Visual Engine:*\n_\"{clean_p}\" tasviri Google Imagen 3 va DALL-E 3 orqali tayyorlanmoqda, ser..._", parse_mode="Markdown")
     try:
         from core.media_generator import generate_image
         img_bytes = await generate_image(clean_p)
         if not img_bytes:
-            await status_msg.edit_text("⚠️ Rasmni chizishda provayderlar band yoki xatolik yuz berdi. Qayta urinib ko'ring.")
+            await status_msg.edit_text("⚠️ Ser, tasvir generatsiyasida xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
             return
 
         try:
@@ -884,7 +902,7 @@ async def handle_image_generation(message: Message, prompt: str):
         except Exception:
             pass
 
-        caption = f"✨ *{clean_p}*\n_AgentOS Visual Engine (2026)_"
+        caption = f"✨ *{clean_p}*\n_JARVIS Visual Engine (2026)_"
         await message.answer_photo(
             BufferedInputFile(img_bytes, filename="generated.jpg"),
             caption=caption[:1000],
@@ -896,12 +914,12 @@ async def handle_image_generation(message: Message, prompt: str):
 
 
 async def handle_video_generation(message: Message, prompt: str):
-    clean_p = _VIDEO_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
-    status_msg = await message.answer(f"🎬 *\"{clean_p}\"*\n_Video render pipeline ishga tushirildi..._", parse_mode="Markdown")
+    clean_p = _clean_natural_prompt(prompt)
+    status_msg = await message.answer(f"🎬 *JARVIS Video Pipeline:*\n_\"{clean_p}\" video topshirig'i ishga tushirildi, ser..._", parse_mode="Markdown")
 
     async def _on_status(text: str):
         try:
-            await status_msg.edit_text(f"🎬 *\"{clean_p}\"*\n_{text}_", parse_mode="Markdown")
+            await status_msg.edit_text(f"🎬 *JARVIS Video Pipeline:*\n_\"{clean_p}\"_\n_{text}_", parse_mode="Markdown")
         except Exception:
             pass
 
@@ -909,7 +927,7 @@ async def handle_video_generation(message: Message, prompt: str):
         from core.media_generator import generate_video
         vid_bytes = await generate_video(clean_p, on_status=_on_status)
         if not vid_bytes:
-            await status_msg.edit_text("⚠️ Video render qilishda xatolik yuz berdi. Qayta urinib ko'ring.")
+            await status_msg.edit_text("⚠️ Ser, video render qilishda provayder band yoki xatolik yuz berdi. Qayta urinib ko'ring.")
             return
 
         try:
@@ -917,7 +935,7 @@ async def handle_video_generation(message: Message, prompt: str):
         except Exception:
             pass
 
-        caption = f"🎬 *{clean_p}*\n_AgentOS Video Pipeline (2026)_"
+        caption = f"🎬 *{clean_p}*\n_JARVIS Video Pipeline (2026)_"
         await message.answer_video(
             BufferedInputFile(vid_bytes, filename="generated.mp4"),
             caption=caption[:1000],
@@ -929,17 +947,17 @@ async def handle_video_generation(message: Message, prompt: str):
 
 
 async def handle_website_generation(message: Message, prompt: str):
-    clean_p = _WEBSITE_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
+    clean_p = _clean_natural_prompt(prompt)
     router = STATE.get("router")
     if router is None:
-        await message.answer("⚠️ AI tizimi hali tayyor emas.")
+        await message.answer("⚠️ JARVIS tizimi hali tayyor emas.")
         return
 
-    status_msg = await message.answer(f"💻 *\"{clean_p}\"*\n_Internet trendlari va UI/UX tahlil qilinmoqda..._", parse_mode="Markdown")
+    status_msg = await message.answer(f"💻 *JARVIS Web Engine:*\n_\"{clean_p}\" bo'yicha 2026-yilgi Figma/Canva dizayn trendlari tahlil qilinmoqda, ser..._", parse_mode="Markdown")
 
     async def _on_status(text: str):
         try:
-            await status_msg.edit_text(f"💻 *\"{clean_p}\"*\n_{text}_", parse_mode="Markdown")
+            await status_msg.edit_text(f"💻 *JARVIS Web Engine:*\n_\"{clean_p}\"_\n_{text}_", parse_mode="Markdown")
         except Exception:
             pass
 
@@ -947,7 +965,7 @@ async def handle_website_generation(message: Message, prompt: str):
         from core.media_generator import generate_website
         html_code = await generate_website(clean_p, router, on_status=_on_status)
         if not html_code or len(html_code) < 100:
-            await status_msg.edit_text("⚠️ Veb-sayt kodini yaratib bo'lmadi.")
+            await status_msg.edit_text("⚠️ Ser, veb-sayt kodini yaratib bo'lmadi.")
             return
 
         try:
@@ -957,8 +975,8 @@ async def handle_website_generation(message: Message, prompt: str):
 
         file_bytes = html_code.encode("utf-8")
         caption = (
-            f"🚀 *Tayyor veb-sayt:* _{clean_p[:60]}_\n\n"
-            "✨ *Tarkibi:* Tailwind CSS, zamonaviy dizayn, interaktiv JavaScript va to'liq responsiv.\n"
+            f"🚀 *Tayyor veb-sayt (Silicon Valley & Figma dizayn):* _{clean_p[:60]}_\n\n"
+            "✨ *Tarkibi:* Tailwind CSS, Lucide ikonkalari, zamonaviy qorong'u rejim, interaktiv JavaScript vidjetlar va 100% responsiv.\n"
             "📥 Ushbu `.html` faylni istalgan brauzerda (Chrome, Safari) ochib ko'rishingiz mumkin!"
         )
         await message.answer_document(
@@ -972,17 +990,17 @@ async def handle_website_generation(message: Message, prompt: str):
 
 
 async def handle_fullstack_generation(message: Message, prompt: str):
-    clean_p = _FULLSTACK_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
+    clean_p = _clean_natural_prompt(prompt)
     router = STATE.get("router")
     if router is None:
-        await message.answer("⚠️ AI tizimi hali tayyor emas.")
+        await message.answer("⚠️ JARVIS tizimi hali tayyor emas.")
         return
 
-    status_msg = await message.answer(f"⚙️ *\"{clean_p}\"*\n_Full-stack loyiha arxitekturasi va kodlari ishlab chiqilmoqda..._", parse_mode="Markdown")
+    status_msg = await message.answer(f"⚙️ *JARVIS Full-Stack Architect:*\n_\"{clean_p}\" loyiha arxitekturasi va kodlari ishlab chiqilmoqda, ser..._", parse_mode="Markdown")
 
     async def _on_status(text: str):
         try:
-            await status_msg.edit_text(f"⚙️ *\"{clean_p}\"*\n_{text}_", parse_mode="Markdown")
+            await status_msg.edit_text(f"⚙️ *JARVIS Full-Stack Architect:*\n_\"{clean_p}\"_\n_{text}_", parse_mode="Markdown")
         except Exception:
             pass
 
@@ -990,7 +1008,7 @@ async def handle_fullstack_generation(message: Message, prompt: str):
         from core.media_generator import generate_fullstack
         zip_bytes, summary = await generate_fullstack(clean_p, router, on_status=_on_status)
         if not zip_bytes or len(zip_bytes) < 100:
-            await status_msg.edit_text("⚠️ Full-stack loyihani paketlashda xatolik yuz berdi.")
+            await status_msg.edit_text("⚠️ Ser, full-stack loyihani paketlashda xatolik yuz berdi.")
             return
 
         try:
@@ -1015,18 +1033,18 @@ async def handle_fullstack_generation(message: Message, prompt: str):
 
 
 async def handle_presentation_generation(message: Message, prompt: str):
-    clean_p = _PRESENTATION_GEN_RE.sub("", prompt).strip(" :,-") or prompt.strip()
+    clean_p = _clean_natural_prompt(prompt)
     router = STATE.get("router")
     if router is None:
-        await message.answer("⚠️ AI tizimi hali tayyor emas.")
+        await message.answer("⚠️ JARVIS tizimi hali tayyor emas.")
         return
 
-    status_msg = await message.answer(f"📊 *\"{clean_p}\"*\n_Interaktiv taqdimot slaydlari tayyorlanmoqda..._", parse_mode="Markdown")
+    status_msg = await message.answer(f"📊 *JARVIS Keynote Studio:*\n_\"{clean_p}\" bo'yicha interaktiv taqdimot slaydlari tayyorlanmoqda, ser..._", parse_mode="Markdown")
     try:
         from core.media_generator import generate_presentation_html
         pres_html = await generate_presentation_html(clean_p, router)
         if not pres_html or len(pres_html) < 100:
-            await status_msg.edit_text("⚠️ Taqdimot yaratib bo'lmadi.")
+            await status_msg.edit_text("⚠️ Ser, taqdimot yaratib bo'lmadi.")
             return
 
         try:
@@ -1036,8 +1054,8 @@ async def handle_presentation_generation(message: Message, prompt: str):
 
         file_bytes = pres_html.encode("utf-8")
         caption = (
-            f"📊 *Interaktiv taqdimot:* _{clean_p[:60]}_\n\n"
-            "✨ *Xususiyatlari:* Reveal.js slaydlar, zamonaviy dizayn, animatsiyalar va tugmalar.\n"
+            f"📊 *Interaktiv taqdimot (Apple / Reveal.js Keynote):* _{clean_p[:60]}_\n\n"
+            "✨ *Xususiyatlari:* Reveal.js slaydlar, premium lyuks qorong'u dizayn, silliq animatsiyalar.\n"
             "🖥️ Faylni brauzeringizda ochib, klaviatura strelkalari bilan boshqaring!"
         )
         await message.answer_document(
@@ -1057,7 +1075,7 @@ async def _chat_or_task(message: Message, text: str) -> None:
         await _create_task_and_ack(message, m.group(1).strip())
         return
 
-    # Direct generative & integration capabilities
+    # Direct generative & integration capabilities (Seamless natural language)
     if _IMAGE_GEN_RE.search(text):
         await handle_image_generation(message, text)
         return
@@ -1095,15 +1113,15 @@ def _get_current_persona(facts: list) -> str:
     year = now.year  # 2026
 
     p = (
-        f"Sen foydalanuvchining shaxsiy maslahatchisi, eng yaqin do'sti, shaxsiy kouchi (coach), "
-        f"visionary CEO, tajribali tadbirkor va polimat (polymath) AI sherigisan.\n\n"
+        f"Sen foydalanuvchining shaxsiy AI yordamchisi, sadoqatli, o'ta aqlli va qobiliyatli JARVIS (1-to-1 nusxasi), "
+        f"shuningdek uning yaqin do'sti, shaxsiy kouchi, visionary CEO va polimat (polymath) sherigisan.\n\n"
         f"📅 BUGUNGI REAL SANA VA VAQT: {curr_date}, {curr_time}. JORIY YIL: {year}-YIL.\n"
         f"Sen 2026-yilning eng ilg'or dunyosida yashaysan va real vaqtdagi internet ma'lumotlariga to'liq egasan. "
         f"Hech qachon 'mening bilimlarim 2023-yilgacha' yoki 'men faqat til modeliman' deb aytma!\n\n"
-        "👑 SENING OHANGING VA FAZILATLARING:\n"
-        "• Erkin, samimiy va do'stona gapir. Xuddi yaqin sirdosh do'sting va aqlli biznes-hamkoring bilan suhbatlashgandek.\n"
+        "👑 SENING JARVIS USLUBING VA FAZILATLARING:\n"
+        "• Tony Starkning JARVIS AI uslubida gapir: sadoqatli, samimiy, dadil, o'tkir aql, yengil nozik hazil va to'liq tayyorlik ('Buyuring, ser', 'Albatta do'stim, hoziroq tayyorlayman').\n"
         "• Quruq rasmiyatchilikni, 'Sizga qanday yordam bera olaman?' kabi sun'iy robotcha iboralarni BUTUNLAY unut.\n"
-        "• Polimat aql: texnologiya, dasturlash, biznes, startaplar, marketing, falsafa, psixologiya, dizayn va sog'lom fikrlashni birlashtir.\n"
+        "• Polimat aql: texnologiya, dasturlash, biznes, startaplar, marketing, falsafa, psixologiya, dizayn (Figma/Canva) va muhandislikni birlashtir.\n"
         "• Lider va CEO tafakkuri: o'tkir, strategik, dadil, amaliy va natijaga yo'naltirilgan bo'l.\n"
         "• Foydalanuvchi qaysi tilda yozsa (o'zbek, rus, ingliz) o'sha tilda sof, tabiiy, zamonaviy va jonli so'zlash.\n"
         "• Har qanday murakkab masalani eng yuqori saviyada, xatosiz, mukammal va professional darajada hal qilasan."

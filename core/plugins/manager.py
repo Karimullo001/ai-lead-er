@@ -7,6 +7,7 @@ from .github_connector import GitHubPlugin
 from .google_connector import GoogleWorkspacePlugin
 from .figma_connector import FigmaPlugin
 from .notion_connector import NotionPlugin
+from .canva_connector import CanvaPlugin
 
 log = logging.getLogger("agentos.plugins.manager")
 
@@ -22,6 +23,7 @@ class PluginManager:
         self.register(GitHubPlugin())
         self.register(GoogleWorkspacePlugin())
         self.register(FigmaPlugin())
+        self.register(CanvaPlugin())
         self.register(NotionPlugin())
 
     def register(self, plugin: BasePlugin) -> None:
