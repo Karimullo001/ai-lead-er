@@ -85,6 +85,10 @@ async def start_hosted_runtime():
         orch=worker.orch,
     ))
 
+    from core.watchdog import Watchdog
+    watchdog = Watchdog(worker.tm, worker.queue, stuck_after_seconds=300.0, poll_seconds=30.0)
+    watchdog_task = asyncio.create_task(watchdog.start())
+
     worker_task = asyncio.create_task(worker.loop())
     telegram_task = asyncio.create_task(
         _telegram_loop(worker.tm, worker.queue, STATE["router"], worker.orch)
@@ -92,6 +96,8 @@ async def start_hosted_runtime():
     _runtime.update(
         worker=worker,
         worker_task=worker_task,
+        watchdog=watchdog,
+        watchdog_task=watchdog_task,
         telegram_task=telegram_task,
         tm=worker.tm,
         queue=worker.queue,
@@ -100,6 +106,19 @@ async def start_hosted_runtime():
 
 async def stop_hosted_runtime(state):
     state["stopping"] = True
+    wd = state.get("watchdog")
+    if wd:
+        try:
+            await wd.stop()
+        except Exception:
+            pass
+    wdt = state.get("watchdog_task")
+    if wdt:
+        wdt.cancel()
+        try:
+            await wdt
+        except asyncio.CancelledError:
+            pass
     tg = state.get("telegram_task")
     if tg:
         tg.cancel()

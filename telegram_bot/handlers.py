@@ -679,14 +679,17 @@ async def cmd_stop_all(message: Message, command: CommandObject):
 @router.message(Command("resume_all"))
 async def cmd_resume_all(message: Message):
     tm: TaskManager = STATE.get("tm")
+    q: TaskQueue = STATE.get("queue")
     if not tm:
         await message.answer("⚠️ Tizim boshqaruvi mavjud emas.")
         return
     uid = _uid(message)
     await tm.set_emergency_stop(False, user_id=uid, reason="Operator released emergency stop")
+    resumed = await tm.resume_emergency_tasks(queue=q)
     await message.answer(
-        "🟢 *Favqulodda to'xtatish holati bekor qilindi.*\n\n"
-        "Tizim va barcha agentlar odatiy avtonom ish rejimiga qaytdi, ser.",
+        f"🟢 *Favqulodda to'xtatish holati bekor qilindi.*\n\n"
+        f"• Qayta tiklangan xavfsiz vazifalar: `{len(resumed)}` ta\n"
+        f"• Tizim va barcha agentlar odatiy avtonom ish rejimiga qaytdi, ser.",
         parse_mode="Markdown"
     )
 

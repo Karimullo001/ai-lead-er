@@ -118,18 +118,8 @@ async def _status_notifier_loop(tm: TaskManager, notifier) -> None:
             if tm.pool is None:
                 await asyncio.sleep(5)
                 continue
-            async with tm.pool.acquire() as c:
-                try:
-                    rows = await c.fetch(
-                        "SELECT * FROM tasks WHERE status IN ('COMPLETED','FAILED','WAITING_APPROVAL','WAITING_FOR_INPUT') "
-                        "AND notified_at IS NULL ORDER BY updated_at ASC LIMIT 50"
-                    )
-                except Exception:
-                    # Backward compatibility fallback
-                    rows = await c.fetch(
-                        "SELECT * FROM tasks WHERE status IN ('COMPLETED','FAILED','WAITING_APPROVAL') "
-                        "ORDER BY updated_at DESC LIMIT 50"
-                    )
+            # Atomically claim pending notifications to guarantee idempotency across workers/instances
+            rows = await tm.claim_pending_notifications(batch_size=20)
             for r in rows:
                 task_id_str = str(r["task_id"])
                 key = task_id_str + ":" + str(r["status"])
@@ -138,27 +128,47 @@ async def _status_notifier_loop(tm: TaskManager, notifier) -> None:
                 seen.add(key)
                 chat_id = r.get("chat_id")
                 if not chat_id:
+                    await tm.mark_notified(task_id_str, success=True)
                     continue
+
                 short = task_id_str[:8]
                 status_val = r["status"]
+                pref = str(r.get("notification_pref") or "text").lower()
+
+                # If user opted out of notifications
+                if pref == "none":
+                    await tm.mark_notified(task_id_str, success=True)
+                    continue
 
                 if status_val == "FAILED":
-                    await notifier.send(chat_id, "❌ Task failed " + short + "\n\nError: " + str(r.get("error") or "unknown")[:2500])
-                    await tm.mark_notified(task_id_str)
+                    try:
+                        await notifier.send(chat_id, "❌ Task failed " + short + "\n\nError: " + str(r.get("error") or "unknown")[:2500])
+                        await tm.mark_notified(task_id_str, success=True)
+                    except Exception as err:
+                        log.warning("Failed delivering FAILED notice for %s: %s", short, err)
+                        await tm.mark_notified(task_id_str, success=False)
                     continue
 
                 if status_val == "WAITING_APPROVAL":
-                    await notifier.send(chat_id, "🔐 Task " + short + " is waiting for approval.")
-                    await tm.mark_notified(task_id_str)
+                    try:
+                        await notifier.send(chat_id, "🔐 Task " + short + " is waiting for approval.")
+                        await tm.mark_notified(task_id_str, success=True)
+                    except Exception as err:
+                        log.warning("Failed delivering WAITING_APPROVAL notice for %s: %s", short, err)
+                        await tm.mark_notified(task_id_str, success=False)
                     continue
 
                 if status_val == "WAITING_FOR_INPUT":
-                    await notifier.send(
-                        chat_id,
-                        f"⏳ *Topshiriq `{short}` qo'shimcha ma'lumot yoki aniqlik kiritishingizni kutmoqda.*\n\n"
-                        f"Iltimos, zaruriy ma'lumotni shu yerda yozib qoldiring."
-                    )
-                    await tm.mark_notified(task_id_str)
+                    try:
+                        await notifier.send(
+                            chat_id,
+                            f"⏳ *Topshiriq `{short}` qo'shimcha ma'lumot yoki aniqlik kiritishingizni kutmoqda.*\n\n"
+                            f"Iltimos, zaruriy ma'lumotni shu yerda yozib qoldiring."
+                        )
+                        await tm.mark_notified(task_id_str, success=True)
+                    except Exception as err:
+                        log.warning("Failed delivering WAITING_FOR_INPUT notice for %s: %s", short, err)
+                        await tm.mark_notified(task_id_str, success=False)
                     continue
 
                 # Status == COMPLETED
@@ -178,9 +188,9 @@ async def _status_notifier_loop(tm: TaskManager, notifier) -> None:
                 except Exception as exc:
                     log.debug("assistant memory save failed: %s", exc)
 
-                pref = str(r.get("notification_pref") or "text").lower()
-                if pref == "call":
-                    try:
+                delivery_ok = False
+                try:
+                    if pref == "call":
                         from core.calling import get_calling_manager, CallTrigger
                         cm_call = get_calling_manager()
                         target_user = int(uid) if (uid and uid.isdigit()) else int(chat_id)
@@ -195,29 +205,28 @@ async def _status_notifier_loop(tm: TaskManager, notifier) -> None:
                             await cm_call.fallback_notify(chat_id, task_id_str, raw, notifier, preferred_mode="voice")
                         else:
                             await notifier.send(chat_id, summary_msg)
-                    except Exception as exc:
-                        log.warning("Call notification error: %s; sending text", exc)
-                        await notifier.send(chat_id, summary_msg)
-                elif pref == "voice":
-                    try:
+                        delivery_ok = True
+                    elif pref == "voice":
                         from core.calling import get_calling_manager
                         cm_call = get_calling_manager()
                         await cm_call.fallback_notify(chat_id, task_id_str, raw, notifier, preferred_mode="voice")
-                    except Exception as exc:
-                        log.warning("Voice notification error: %s; sending text", exc)
+                        delivery_ok = True
+                    else:
                         await notifier.send(chat_id, summary_msg)
-                else:
-                    await notifier.send(chat_id, summary_msg)
+                        delivery_ok = True
 
-                try:
-                    artifacts = json.loads(artifact_json.strip()) if artifact_json.strip() else []
-                except Exception:
-                    artifacts = []
-                for artifact in artifacts:
-                    if isinstance(artifact, dict):
-                        await notifier.send_artifact(chat_id, artifact)
+                    try:
+                        artifacts = json.loads(artifact_json.strip()) if artifact_json.strip() else []
+                    except Exception:
+                        artifacts = []
+                    for artifact in artifacts:
+                        if isinstance(artifact, dict):
+                            await notifier.send_artifact(chat_id, artifact)
 
-                await tm.mark_notified(task_id_str)
+                    await tm.mark_notified(task_id_str, success=True)
+                except Exception as err:
+                    log.warning("Notification delivery error for %s: %s; allowing retry", short, err)
+                    await tm.mark_notified(task_id_str, success=False)
         except Exception as exc:
             log.debug("notifier loop: %s", exc)
         await asyncio.sleep(5)

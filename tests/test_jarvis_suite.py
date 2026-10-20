@@ -77,7 +77,7 @@ from core.task_manager import TaskManager, TaskStatus
 
 
 class TestCallingSubsystem(unittest.TestCase):
-    """Test Telegram Voice Calling subsystem and honest diagnostics."""
+    """Test Telegram Voice Calling subsystem, truthful diagnostics, and policies."""
 
     def setUp(self):
         self.config = CallingConfig(
@@ -119,35 +119,42 @@ class TestCallingSubsystem(unittest.TestCase):
 
     def test_status_diagnostics_when_disabled(self):
         self.cm._mtproto_available = True
+        self.cm._voip_bridge_available = True
         self.cm.config.enabled = False
         status = self.cm.get_status()
         self.assertEqual(status["state"], CallState.DISABLED.value)
 
+    def test_is_ready_to_call_when_voip_bridge_missing(self):
+        self.cm._mtproto_available = True
+        self.cm._voip_bridge_available = False
+        ok, reason = self.cm.is_ready_to_call(recipient_id=987654321)
+        self.assertFalse(ok)
+        self.assertIn("WebRTC VoIP audio", reason)
+
     def test_is_ready_to_call_unauthorized_user(self):
         self.cm._mtproto_available = True
-        ok, reason = self.cm.is_ready_to_call(recipient_id=555555)  # Not authorized
+        self.cm._voip_bridge_available = True
+        ok, reason = self.cm.is_ready_to_call(recipient_id=555555)
         self.assertFalse(ok)
         self.assertIn("Calling restricted", reason)
 
     def test_is_ready_to_call_cooldown(self):
         self.cm._mtproto_available = True
-        self.cm.last_call_time = time.time()  # Just called
+        self.cm._voip_bridge_available = True
+        self.cm.last_call_time = time.time()
         ok, reason = self.cm.is_ready_to_call(recipient_id=987654321)
         self.assertFalse(ok)
         self.assertIn("cooldown active", reason.lower())
 
     def test_enable_and_disable_security(self):
-        # Unauthorized user cannot enable/disable
         ok, msg = self.cm.disable(user_id=123)
         self.assertFalse(ok)
         self.assertIn("Permission denied", msg)
 
-        # Authorized owner can disable
         ok, msg = self.cm.disable(user_id=987654321)
         self.assertTrue(ok)
         self.assertFalse(self.cm.config.enabled)
 
-        # Authorized owner can enable
         ok, msg = self.cm.enable(user_id=987654321)
         self.assertTrue(ok)
         self.assertTrue(self.cm.config.enabled)
@@ -157,6 +164,7 @@ class TestCallingSubsystem(unittest.TestCase):
         self.assertIn("test_passed", res)
         self.assertIn("readiness_reason", res)
         self.assertIn("status_details", res)
+        self.assertIn("recommendation", res)
 
     def test_singleton_get_calling_manager(self):
         cm1 = get_calling_manager()
@@ -164,8 +172,8 @@ class TestCallingSubsystem(unittest.TestCase):
         self.assertIs(cm1, cm2)
 
 
-class TestTaskManagerAndEmergencyStop(unittest.IsolatedAsyncioTestCase):
-    """Test TaskManager contract extensions and global emergency stop."""
+class TestTaskManagerContractsAndRecovery(unittest.IsolatedAsyncioTestCase):
+    """Test TaskManager contracts, emergency stop, and failure recovery."""
 
     async def test_emergency_stop_lifecycle(self):
         tm = TaskManager("postgresql://mock/db")
@@ -174,31 +182,94 @@ class TestTaskManagerAndEmergencyStop(unittest.IsolatedAsyncioTestCase):
         mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
         tm.pool = mock_pool
 
-        # Set emergency stop True
         await tm.set_emergency_stop(True, user_id="user_admin", reason="Test Kill Switch")
         self.assertTrue(mock_conn.execute.called)
 
-        # Mock is_emergency_stop_active returning True
         mock_conn.fetchrow.return_value = {"value_bool": True}
         active = await tm.is_emergency_stop_active()
         self.assertTrue(active)
 
-        # Mock is_emergency_stop_active returning False
         mock_conn.fetchrow.return_value = {"value_bool": False}
         active = await tm.is_emergency_stop_active()
         self.assertFalse(active)
 
-    async def test_mark_notified(self):
+    async def test_mark_notified_delivery_and_retry(self):
         tm = TaskManager("postgresql://mock/db")
         mock_conn = AsyncMock()
         mock_pool = MagicMock()
         mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
         tm.pool = mock_pool
 
-        await tm.mark_notified("task-12345")
-        mock_conn.execute.assert_called_once()
+        # Successful delivery
+        await tm.mark_notified("task-12345", success=True)
         query = mock_conn.execute.call_args[0][0]
         self.assertIn("UPDATE tasks SET notified_at=$2", query)
+
+        # Failed delivery releases notified_at to NULL for retry
+        await tm.mark_notified("task-12345", success=False)
+        val = mock_conn.execute.call_args[0][2]
+        self.assertIsNone(val)
+
+    async def test_claim_pending_notifications(self):
+        tm = TaskManager("postgresql://mock/db")
+        mock_conn = AsyncMock()
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        tm.pool = mock_pool
+
+        mock_conn.fetch.return_value = [
+            {"task_id": "task-abc", "status": "COMPLETED", "chat_id": "123"}
+        ]
+        claimed = await tm.claim_pending_notifications(batch_size=10)
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["task_id"], "task-abc")
+
+    async def test_recover_orphaned_tasks_category_differentiation(self):
+        tm = TaskManager("postgresql://mock/db")
+        mock_conn = AsyncMock()
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        tm.pool = mock_pool
+        mock_queue = AsyncMock()
+
+        # Simulate 1 Category A task and 1 Category C task stuck in RUNNING
+        mock_conn.fetch.return_value = [
+            {"task_id": "task-cat-a", "decision_category": "A", "retry_count": 0, "max_retries": 3},
+            {"task_id": "task-cat-c", "decision_category": "C", "retry_count": 0, "max_retries": 3},
+        ]
+
+        recovered = await tm.recover_orphaned_tasks(queue=mock_queue, older_than_seconds=300.0)
+
+        # Category A should be recovered and enqueued
+        self.assertIn("task-cat-a", recovered)
+        mock_queue.enqueue.assert_called_once_with("task-cat-a", {"recovery": "true", "retry": "1"})
+
+        # Category C should NOT be blindly re-enqueued (requires approval)
+        self.assertNotIn("task-cat-c", recovered)
+
+    async def test_resume_emergency_tasks_selective(self):
+        tm = TaskManager("postgresql://mock/db")
+        mock_conn = AsyncMock()
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        tm.pool = mock_pool
+        mock_queue = AsyncMock()
+
+        # Task 1: Category A
+        # Task 2: Category C mid-execution (step="executing_sql")
+        mock_conn.fetch.return_value = [
+            {"task_id": "task-resume-a", "decision_category": "A", "current_step": "executing"},
+            {"task_id": "task-resume-c", "decision_category": "C", "current_step": "executing_sql"},
+        ]
+
+        resumed = await tm.resume_emergency_tasks(queue=mock_queue)
+
+        # Category A is resumed
+        self.assertIn("task-resume-a", resumed)
+        mock_queue.enqueue.assert_called_once_with("task-resume-a", {"resumed_from_emergency": "true"})
+
+        # Category C mid-execution is NOT blindly resumed
+        self.assertNotIn("task-resume-c", resumed)
 
 
 class TestCircuitBreakerAndWorker(unittest.IsolatedAsyncioTestCase):
@@ -210,16 +281,13 @@ class TestCircuitBreakerAndWorker(unittest.IsolatedAsyncioTestCase):
         cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=10.0)
         self.assertFalse(cb.is_open("openai"))
 
-        # 2 failures -> not open yet
         await cb.record_failure("openai")
         await cb.record_failure("openai")
         self.assertFalse(cb.is_open("openai"))
 
-        # 3rd failure -> open
         await cb.record_failure("openai")
         self.assertTrue(cb.is_open("openai"))
 
-        # Success resets circuit
         await cb.record_success("openai")
         self.assertFalse(cb.is_open("openai"))
 
@@ -237,11 +305,34 @@ class TestCircuitBreakerAndWorker(unittest.IsolatedAsyncioTestCase):
         worker.orch = mock_orch
         await worker._run_task("task-test-999")
 
-        # Worker must have set task status to PAUSED and never invoked orchestrator
         mock_tm.set_status.assert_called_once_with(
             "task-test-999", TaskStatus.PAUSED, error="Global emergency stop engaged"
         )
         mock_orch.run_task.assert_not_called()
+
+
+class TestConversationMemoryAndSecurity(unittest.IsolatedAsyncioTestCase):
+    """Test ConversationMemory secret redaction and null safety."""
+
+    async def test_redact_secrets(self):
+        from core.conversation_memory import redact_secrets
+
+        raw = "My OpenAI key is sk-abcdef1234567890abcdef1234567890 and bot is 123456789:ABCDefGhiJklMnoPqrStuVwXyz123456789"
+        clean = redact_secrets(raw)
+        self.assertNotIn("sk-abcdef1234567890", clean)
+        self.assertNotIn("123456789:ABC", clean)
+        self.assertIn("[REDACTED_SECRET]", clean)
+
+    async def test_conversation_memory_none_pool(self):
+        from core.conversation_memory import ConversationMemory
+
+        cm = ConversationMemory(pool=None)
+        # Should not raise exception
+        await cm.ensure()
+        await cm.append("user1", "chat1", "user", "secret: sk-12345678901234567890")
+        hist = await cm.render("user1", "chat1")
+        self.assertEqual(hist, "")
+        await cm.clear("user1", "chat1")
 
 
 class TestNaturalLanguageAndPersona(unittest.TestCase):
@@ -250,14 +341,12 @@ class TestNaturalLanguageAndPersona(unittest.TestCase):
     def test_regex_matching_for_calling_and_emergency(self):
         from telegram_bot.handlers import _CALL_REQUEST_RE, _EMERGENCY_STOP_RE
 
-        # Calling queries
         self.assertTrue(_CALL_REQUEST_RE.search("/call"))
         self.assertTrue(_CALL_REQUEST_RE.search("Menga qo'ng'iroq qil"))
         self.assertTrue(_CALL_REQUEST_RE.search("Please call me right now"))
         self.assertTrue(_CALL_REQUEST_RE.search("Позвони мне"))
         self.assertTrue(_CALL_REQUEST_RE.search("Meni chaqir"))
 
-        # Emergency stop queries
         self.assertTrue(_EMERGENCY_STOP_RE.search("/stop_all"))
         self.assertTrue(_EMERGENCY_STOP_RE.search("/kill_switch"))
         self.assertTrue(_EMERGENCY_STOP_RE.search("Emergency stop immediately"))
@@ -278,19 +367,15 @@ class TestNaturalLanguageAndPersona(unittest.TestCase):
         facts = ["Foydalanuvchi ismi: Karimullo", "Kasbi: Dasturchi"]
         persona = _get_current_persona(facts)
 
-        # 2026 check
         self.assertIn("2026", persona)
-        # Intellectual honesty rules
         self.assertIn("INTELLECTUAL HONESTY", persona)
         self.assertIn("Foydalanuvchining ko'nglini olish uchungina", persona)
         self.assertIn("Hech qachon soxta manbalar", persona)
-        # 9 Adaptive modes
         self.assertIn("9 ADAPTIVE MODES", persona)
         self.assertIn("Ustoz va Murabbiy", persona)
         self.assertIn("Tanqidiy Fikrlovchi", persona)
         self.assertIn("Avtonom Dasturchi", persona)
         self.assertIn("Strategik Maslahatchi", persona)
-        # Facts inclusion
         self.assertIn("Karimullo", persona)
 
 

@@ -69,6 +69,10 @@ class Worker:
         self.orch = Orchestrator(events, comm)
         for spec in build_demo_specs():
             self.orch.register_agent(factory.build(spec))
+        try:
+            await self.tm.recover_orphaned_tasks(self.queue)
+        except Exception as _rec_exc:
+            log.warning("Initial orphaned tasks recovery notice: %s", _rec_exc)
         log.info("Worker %s ready with %d agents", self.name, len(self.orch.agents))
 
     async def loop(self) -> None:
@@ -279,6 +283,12 @@ class Worker:
             await self.tm.save_checkpoint(task_id, {"phase": "error",
                                                     "error": str(e)})
             raise
+        finally:
+            monitor.cancel()
+            try:
+                await monitor
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def shutdown(self) -> None:
         self.stop.set()

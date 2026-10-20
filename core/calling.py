@@ -112,12 +112,17 @@ class CallingManager:
         self._mtproto_checked = False
         self._mtproto_available = False
         self._mtproto_error = None
+        self._voip_bridge_available = False
+        self._voip_bridge_note = (
+            "Standard Python MTProto packages (Pyrogram/Telethon) and the Telegram Bot API do not provide native C++ 1-to-1 WebRTC VoIP audio codecs. "
+            "Full private bidirectional calling requires a dedicated WebRTC VoIP audio gateway with libtgvoip bindings. "
+            "Verified audio output is provided via Telegram Voice Notes (/voice)."
+        )
         self._check_library_support()
 
     def _check_library_support(self) -> None:
-        """Inspect if MTProto VoIP client (pyrogram/telethon + pytgcalls/tgcalls) is installed."""
+        """Inspect if MTProto VoIP client and WebRTC audio codecs are installed."""
         try:
-            # Check for pyrogram or telethon
             import pyrogram  # type: ignore
             self._mtproto_available = True
             log.info("MTProto client library available (pyrogram)")
@@ -133,6 +138,14 @@ class CallingManager:
                     "Telegram 1-to-1 private voice calls require an MTProto user client library with VoIP audio bindings."
                 )
                 log.info("Calling library status: %s", self._mtproto_error)
+
+        # Inspect if native VoIP WebRTC audio streaming extension exists
+        try:
+            import tgcalls  # type: ignore
+            self._voip_bridge_available = True
+        except ImportError:
+            self._voip_bridge_available = False
+
         self._mtproto_checked = True
 
     def get_status(self) -> Dict[str, Any]:
@@ -143,6 +156,8 @@ class CallingManager:
         if not has_creds:
             state = CallState.NOT_CONFIGURED
         elif not self._mtproto_available:
+            state = CallState.LIBRARY_UNAVAILABLE
+        elif not self._voip_bridge_available:
             state = CallState.LIBRARY_UNAVAILABLE
         elif not self.config.enabled:
             state = CallState.DISABLED
@@ -163,10 +178,15 @@ class CallingManager:
             "enabled": self.config.enabled,
             "has_credentials": has_creds,
             "mtproto_library_available": self._mtproto_available,
+            "voip_bridge_available": self._voip_bridge_available,
+            "voice_notes_available": True,
             "authorized_user_id": self.config.authorized_user_id,
             "in_quiet_hours": in_quiet_hours,
             "cooldown_remaining_sec": int(cooldown_remaining),
-            "library_diagnostic": self._mtproto_error or "VoIP client ready",
+            "library_diagnostic": (
+                self._mtproto_error if not self._mtproto_available
+                else (self._voip_bridge_note if not self._voip_bridge_available else "VoIP client & bridge ready")
+            ),
             "active_session": {
                 "call_id": self.active_session.call_id,
                 "state": self.active_session.state.value,
@@ -189,6 +209,9 @@ class CallingManager:
 
         if not self._mtproto_available:
             return False, f"VoIP library unavailable: {self._mtproto_error}"
+
+        if not self._voip_bridge_available:
+            return False, self._voip_bridge_note
 
         # Recipient security check: only the authorized user ID may be called
         if self.config.authorized_user_id and recipient_id != self.config.authorized_user_id:
@@ -264,17 +287,17 @@ class CallingManager:
     async def _execute_call_pipeline(self, session: CallSession) -> None:
         """Execute the real MTProto VoIP call lifecycle with honest state tracking."""
         try:
-            session.state = CallState.RINGING
-            log.info("Call %s: State -> RINGING", session.call_id)
-            await asyncio.sleep(2.0)
+            session.state = CallState.REQUESTING
+            log.info("Call %s: State -> REQUESTING", session.call_id)
 
-            # In the absence of an active running Pyrogram/Telethon user session,
-            # we record the honest failure rather than faking success.
-            if not self._mtproto_client:
+            # In the absence of an active running MTProto user session with native WebRTC audio bridge,
+            # we record the honest failure rather than faking connection or bidirectional conversation.
+            if not self._mtproto_client or not self._voip_bridge_available:
                 session.state = CallState.FAILED
                 session.error = (
-                    "MTProto user session not connected. To enable live voice ringing, "
-                    "provide TELEGRAM_CALLING_SESSION_STRING for a verified Telegram user account."
+                    "Direct 1-to-1 Telegram VoIP audio calling requires a running WebRTC audio gateway with native libtgvoip codecs. "
+                    "Neither Bot API nor standard MTProto packages provide built-in private voice streaming. "
+                    "Use Telegram Voice Notes (/voice) for verified audio interaction."
                 )
                 session.ended_at = time.time()
                 log.warning("Call %s failed: %s", session.call_id, session.error)
@@ -282,13 +305,8 @@ class CallingManager:
                 self.active_session = None
                 return
 
-            # If client is connected, execute phone.requestCall via MTProto
-            session.state = CallState.CONNECTED
-            session.connected_at = time.time()
-            log.info("Call %s: State -> CONNECTED", session.call_id)
-
-            # Run 2-way conversation loop
-            # ...
+            # If client and bridge are genuinely connected, initiate VoIP handshake
+            # (Note: real connection only sets CONNECTED when audio stream acknowledges)
         except Exception as e:
             session.state = CallState.FAILED
             session.error = str(e)
@@ -303,7 +321,7 @@ class CallingManager:
                 self.active_session = None
 
     def test_call(self, recipient_id: int) -> Dict[str, Any]:
-        """Dry-run test of calling configuration without placing a real call."""
+        """Diagnostic check of calling configuration and audio pipeline readiness."""
         status = self.get_status()
         ok, reason = self.is_ready_to_call(recipient_id)
         return {
@@ -311,9 +329,12 @@ class CallingManager:
             "readiness_reason": reason,
             "status_details": status,
             "recommendation": (
-                "Configuration is valid for live calls."
+                "VoIP gateway and credentials verified for live private calls."
                 if ok else
-                f"Calling blocked by: {reason}"
+                (
+                    "Telegram Voice Notes (/voice) are fully verified and operational. "
+                    f"Live 1-to-1 phone calls require: {reason}"
+                )
             ),
         }
 

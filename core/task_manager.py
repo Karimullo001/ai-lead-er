@@ -223,12 +223,147 @@ class TaskManager:
                               "notification_pref": notification_pref, "category": decision_category})
         return tid
 
-    async def mark_notified(self, task_id: str) -> None:
-        """Record timestamp that completion notification was successfully delivered."""
+    async def claim_pending_notifications(self, batch_size: int = 20) -> List[Dict[str, Any]]:
+        """
+        Atomically claim tasks ready for notification with in-flight reservation (-1).
+        Prevents multiple workers or loops from sending duplicate completion notifications.
+        Retries any in-flight claims that stalled or crashed (> 60s).
+        """
+        if self.pool is None:
+            return []
+        now = time.time()
+        stale_cutoff = now - 60.0
+        async with self.pool.acquire() as c:
+            try:
+                rows = await c.fetch("""
+                    UPDATE tasks
+                    SET notified_at = -1, updated_at = $1
+                    WHERE task_id IN (
+                        SELECT task_id FROM tasks
+                        WHERE status IN ('COMPLETED', 'FAILED', 'WAITING_APPROVAL', 'WAITING_FOR_INPUT')
+                          AND (notified_at IS NULL OR (notified_at < 0 AND updated_at < $2))
+                        ORDER BY updated_at ASC
+                        LIMIT $3
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING *;
+                """, now, stale_cutoff, batch_size)
+                return [dict(r) for r in rows]
+            except Exception as ex:
+                log.debug("claim_pending_notifications fallback: %s", ex)
+                rows = await c.fetch("""
+                    SELECT * FROM tasks
+                    WHERE status IN ('COMPLETED', 'FAILED', 'WAITING_APPROVAL', 'WAITING_FOR_INPUT')
+                      AND notified_at IS NULL
+                    ORDER BY updated_at ASC
+                    LIMIT $1
+                """, batch_size)
+                return [dict(r) for r in rows]
+
+    async def mark_notified(self, task_id: str, success: bool = True) -> None:
+        """
+        Record timestamp when notification is successfully delivered,
+        or reset to NULL on delivery failure to allow safe retry.
+        """
         if self.pool is None:
             return
+        now = time.time()
+        val = now if success else None
         async with self.pool.acquire() as c:
-            await c.execute("UPDATE tasks SET notified_at=$2, updated_at=$2 WHERE task_id=$1", task_id, time.time())
+            await c.execute("UPDATE tasks SET notified_at=$2, updated_at=$3 WHERE task_id=$1",
+                            task_id, val, now)
+
+    async def recover_orphaned_tasks(self, queue=None, older_than_seconds: float = 300.0) -> List[str]:
+        """
+        Recovers tasks stuck in RUNNING from dead worker instances.
+        Category A & B tasks are transitioned to WAITING_RETRY and re-queued.
+        Category C tasks (sensitive/destructive) are transitioned to WAITING_APPROVAL
+        to avoid duplicating irreversible actions.
+        """
+        if self.pool is None:
+            return []
+        cutoff = time.time() - older_than_seconds
+        recovered: List[str] = []
+        now = time.time()
+        async with self.pool.acquire() as c:
+            rows = await c.fetch("""
+                SELECT task_id, decision_category, retry_count, max_retries
+                FROM tasks
+                WHERE status='RUNNING' AND updated_at < $1
+            """, cutoff)
+            for r in rows:
+                tid = r["task_id"]
+                cat = str(r.get("decision_category") or "A").upper()
+                rc = int(r.get("retry_count") or 0)
+                max_r = int(r.get("max_retries") or 3)
+                if cat == "C":
+                    await c.execute("""
+                        UPDATE tasks SET status='WAITING_APPROVAL',
+                        error='Interrupted during worker restart; manual confirmation required before re-executing irreversible actions',
+                        updated_at=$2 WHERE task_id=$1
+                    """, tid, now)
+                    await self.log_event(tid, "task.recovery_blocked_category_c", {})
+                elif rc < max_r:
+                    await c.execute("""
+                        UPDATE tasks SET status='WAITING_RETRY',
+                        retry_count=COALESCE(retry_count,0)+1,
+                        error='Recovered from interrupted worker process',
+                        updated_at=$2 WHERE task_id=$1
+                    """, tid, now)
+                    if queue:
+                        await queue.enqueue(tid, {"recovery": "true", "retry": str(rc + 1)})
+                    recovered.append(tid)
+                    await self.log_event(tid, "task.recovered", {"retry": rc + 1})
+                else:
+                    await c.execute("""
+                        UPDATE tasks SET status='FAILED',
+                        error='Worker crashed and maximum retries exceeded',
+                        updated_at=$2 WHERE task_id=$1
+                    """, tid, now)
+                    recovered.append(tid)
+        if recovered:
+            log.info("recover_orphaned_tasks: recovered %d interrupted tasks", len(recovered))
+        return recovered
+
+    async def resume_emergency_tasks(self, queue=None) -> List[str]:
+        """
+        Safely resumes tasks paused by operator emergency stop.
+        Category A & B tasks (and Category C tasks that had not executed steps)
+        are transitioned back to QUEUED and re-enqueued.
+        Category C tasks that were mid-execution are held in WAITING_APPROVAL.
+        """
+        if self.pool is None:
+            return []
+        resumed: List[str] = []
+        now = time.time()
+        async with self.pool.acquire() as c:
+            rows = await c.fetch("""
+                SELECT task_id, decision_category, current_step
+                FROM tasks
+                WHERE status='PAUSED' AND error='Emergency stop triggered by operator'
+            """)
+            for r in rows:
+                tid = r["task_id"]
+                cat = str(r.get("decision_category") or "A").upper()
+                step = r.get("current_step")
+                if cat == "C" and step and step not in ("starting", "queued", None):
+                    await c.execute("""
+                        UPDATE tasks SET status='WAITING_APPROVAL',
+                        error='Paused during emergency stop; manual approval required to resume Category C action',
+                        updated_at=$2 WHERE task_id=$1
+                    """, tid, now)
+                else:
+                    await c.execute("""
+                        UPDATE tasks SET status='QUEUED', error=NULL, updated_at=$2
+                        WHERE task_id=$1
+                    """, tid, now)
+                    if queue:
+                        await queue.enqueue(tid, {"resumed_from_emergency": "true"})
+                    resumed.append(tid)
+                    await self.log_event(tid, "task.resumed_from_emergency", {})
+        if resumed:
+            log.info("resume_emergency_tasks: resumed %d tasks", len(resumed))
+        return resumed
 
     # ---------------- emergency stop ----------------
 

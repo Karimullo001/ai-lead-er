@@ -206,6 +206,9 @@ class ModelRouter:
                 last_error = e
                 log.warning("router stream error on %s/%s: %s", pname, model, e)
                 await self.breaker.record_failure(pname)
+                # If tokens were already yielded to consumer, do not restart from token 0 with a fallback provider
+                if has_tokens:
+                    raise RuntimeError(f"Stream interrupted from {pname}/{model} after partial output: {e}")
                 continue
         if last_error is not None:
             raise RuntimeError(f"ModelRouter stream: all providers failed. Last: {last_error}")
