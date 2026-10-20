@@ -74,6 +74,11 @@ async def main() -> None:
         BotCommand(command="presentation", description="Taqdimot tayyorlash (Reveal.js)"),
         BotCommand(command="plugins", description="Ulangan servislar & Plaginlar"),
         BotCommand(command="github", description="GitHub repositoriyalar & push"),
+        BotCommand(command="call", description="Ovozli qo'ng'iroq (JARVIS Voice Call)"),
+        BotCommand(command="call_status", description="Qo'ng'iroq diagnostikasi"),
+        BotCommand(command="call_test", description="Qo'ng'iroq sinovi"),
+        BotCommand(command="stop_all", description="Favqulodda to'xtatish (Kill Switch)"),
+        BotCommand(command="resume_all", description="Favqulodda holatni bekor qilish"),
         BotCommand(command="search", description="Internetdan qidirish (2026)"),
         BotCommand(command="voice", description="Ovozli javob rejimi"),
         BotCommand(command="clear", description="Suhbat tarixini tozalash"),
@@ -110,35 +115,100 @@ async def _status_notifier_loop(tm: TaskManager, notifier) -> None:
     seen = set()
     while True:
         try:
+            if tm.pool is None:
+                await asyncio.sleep(5)
+                continue
             async with tm.pool.acquire() as c:
-                rows = await c.fetch("SELECT * FROM tasks WHERE status IN ('COMPLETED','FAILED','WAITING_APPROVAL') ORDER BY updated_at DESC LIMIT 50")
+                try:
+                    rows = await c.fetch(
+                        "SELECT * FROM tasks WHERE status IN ('COMPLETED','FAILED','WAITING_APPROVAL','WAITING_FOR_INPUT') "
+                        "AND notified_at IS NULL ORDER BY updated_at ASC LIMIT 50"
+                    )
+                except Exception:
+                    # Backward compatibility fallback
+                    rows = await c.fetch(
+                        "SELECT * FROM tasks WHERE status IN ('COMPLETED','FAILED','WAITING_APPROVAL') "
+                        "ORDER BY updated_at DESC LIMIT 50"
+                    )
             for r in rows:
-                key = str(r["task_id"]) + ":" + str(r["status"])
+                task_id_str = str(r["task_id"])
+                key = task_id_str + ":" + str(r["status"])
                 if key in seen:
                     continue
                 seen.add(key)
                 chat_id = r.get("chat_id")
                 if not chat_id:
                     continue
-                short = str(r["task_id"])[:8]
-                if r["status"] == "FAILED":
+                short = task_id_str[:8]
+                status_val = r["status"]
+
+                if status_val == "FAILED":
                     await notifier.send(chat_id, "❌ Task failed " + short + "\n\nError: " + str(r.get("error") or "unknown")[:2500])
+                    await tm.mark_notified(task_id_str)
                     continue
-                if r["status"] == "WAITING_APPROVAL":
+
+                if status_val == "WAITING_APPROVAL":
                     await notifier.send(chat_id, "🔐 Task " + short + " is waiting for approval.")
+                    await tm.mark_notified(task_id_str)
                     continue
+
+                if status_val == "WAITING_FOR_INPUT":
+                    await notifier.send(
+                        chat_id,
+                        f"⏳ *Topshiriq `{short}` qo'shimcha ma'lumot yoki aniqlik kiritishingizni kutmoqda.*\n\n"
+                        f"Iltimos, zaruriy ma'lumotni shu yerda yozib qoldiring."
+                    )
+                    await tm.mark_notified(task_id_str)
+                    continue
+
+                # Status == COMPLETED
                 raw = r.get("result") or ""
                 artifact_json = ""
                 if "__ARTIFACTS_JSON__" in raw:
                     raw, artifact_json = raw.split("__ARTIFACTS_JSON__", 1)
                 elapsed = (r.get("completed_at") or 0) - (r.get("started_at") or 0)
-                await notifier.send(chat_id, "✅ Task completed " + short + "\n⏱ " + str(int(elapsed)) + "s\n\n" + raw.strip()[:3000])
+                summary_msg = "✅ Task completed " + short + "\n⏱ " + str(int(elapsed)) + "s\n\n" + raw.strip()[:3000]
+
+                uid = str(r.get("user_id") or "")
                 try:
                     from core.conversation_memory import ConversationMemory
-                    cm=ConversationMemory(tm.pool); await cm.ensure()
-                    await cm.append(str(r.get("user_id") or ""), str(chat_id), "assistant", raw.strip()[:12000])
+                    cm = ConversationMemory(tm.pool)
+                    await cm.ensure()
+                    await cm.append(uid, str(chat_id), "assistant", raw.strip()[:12000])
                 except Exception as exc:
                     log.debug("assistant memory save failed: %s", exc)
+
+                pref = str(r.get("notification_pref") or "text").lower()
+                if pref == "call":
+                    try:
+                        from core.calling import get_calling_manager, CallTrigger
+                        cm_call = get_calling_manager()
+                        target_user = int(uid) if (uid and uid.isdigit()) else int(chat_id)
+                        call_ok, call_reason = await cm_call.request_call(
+                            recipient_id=target_user,
+                            trigger=CallTrigger.TASK_COMPLETION,
+                            task_id=task_id_str,
+                            prompt_summary=raw[:200],
+                        )
+                        if not call_ok:
+                            log.info("Call notification unfeasible (%s); fallback to voice note", call_reason)
+                            await cm_call.fallback_notify(chat_id, task_id_str, raw, notifier, preferred_mode="voice")
+                        else:
+                            await notifier.send(chat_id, summary_msg)
+                    except Exception as exc:
+                        log.warning("Call notification error: %s; sending text", exc)
+                        await notifier.send(chat_id, summary_msg)
+                elif pref == "voice":
+                    try:
+                        from core.calling import get_calling_manager
+                        cm_call = get_calling_manager()
+                        await cm_call.fallback_notify(chat_id, task_id_str, raw, notifier, preferred_mode="voice")
+                    except Exception as exc:
+                        log.warning("Voice notification error: %s; sending text", exc)
+                        await notifier.send(chat_id, summary_msg)
+                else:
+                    await notifier.send(chat_id, summary_msg)
+
                 try:
                     artifacts = json.loads(artifact_json.strip()) if artifact_json.strip() else []
                 except Exception:
@@ -146,6 +216,8 @@ async def _status_notifier_loop(tm: TaskManager, notifier) -> None:
                 for artifact in artifacts:
                     if isinstance(artifact, dict):
                         await notifier.send_artifact(chat_id, artifact)
+
+                await tm.mark_notified(task_id_str)
         except Exception as exc:
             log.debug("notifier loop: %s", exc)
         await asyncio.sleep(5)

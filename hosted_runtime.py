@@ -160,6 +160,32 @@ async def _telegram_loop(tm, queue, router_model, orch):
         dp.include_router(router)
         _runtime["bot"] = bot
         _runtime["dispatcher"] = dp
+        try:
+            from aiogram.types import BotCommand
+            await bot.set_my_commands([
+                BotCommand(command="start", description="Boshlash / Yordam"),
+                BotCommand(command="image", description="Rasm chizish (Google / DALL-E / Flux)"),
+                BotCommand(command="video", description="Video yaratish (MP4)"),
+                BotCommand(command="web", description="Veb-sayt yaratish (HTML5/Tailwind)"),
+                BotCommand(command="fullstack", description="Full-stack ilova (.zip loyiha)"),
+                BotCommand(command="presentation", description="Taqdimot tayyorlash (Reveal.js)"),
+                BotCommand(command="plugins", description="Ulangan servislar & Plaginlar"),
+                BotCommand(command="github", description="GitHub repositoriyalar & push"),
+                BotCommand(command="call", description="Ovozli qo'ng'iroq (JARVIS Voice Call)"),
+                BotCommand(command="call_status", description="Qo'ng'iroq diagnostikasi"),
+                BotCommand(command="call_test", description="Qo'ng'iroq sinovi"),
+                BotCommand(command="stop_all", description="Favqulodda to'xtatish (Kill Switch)"),
+                BotCommand(command="resume_all", description="Favqulodda holatni bekor qilish"),
+                BotCommand(command="search", description="Internetdan qidirish (2026)"),
+                BotCommand(command="voice", description="Ovozli javob rejimi"),
+                BotCommand(command="clear", description="Suhbat tarixini tozalash"),
+                BotCommand(command="memory", description="Eslab qolingan faktlar"),
+                BotCommand(command="status", description="Tizim va AI holati"),
+                BotCommand(command="help", description="Yordam"),
+            ])
+        except Exception as _cmd_exc:
+            log.debug("Failed setting Telegram commands: %s", _cmd_exc)
+
         external = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
         if external:
             secret = _agentos_hashlib.sha256(token.encode()).hexdigest()

@@ -13,6 +13,7 @@ class TaskStatus(str, Enum):
     RUNNING = "RUNNING"
     PAUSED = "PAUSED"
     WAITING_APPROVAL = "WAITING_APPROVAL"
+    WAITING_FOR_INPUT = "WAITING_FOR_INPUT"
     WAITING_RETRY = "WAITING_RETRY"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -43,6 +44,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   result          TEXT,
   error           TEXT,
   plan_json       JSONB,
+  contract_json   JSONB,
+  notification_pref TEXT DEFAULT 'text',
+  notified_at     DOUBLE PRECISION,
+  decision_category TEXT DEFAULT 'A',
   created_at      DOUBLE PRECISION NOT NULL,
   started_at      DOUBLE PRECISION,
   updated_at      DOUBLE PRECISION NOT NULL,
@@ -105,6 +110,13 @@ CREATE TABLE IF NOT EXISTS heartbeats (
   meta            JSONB
 );
 
+CREATE TABLE IF NOT EXISTS system_flags (
+  flag_name       TEXT PRIMARY KEY,
+  value_bool      BOOLEAN NOT NULL,
+  details         JSONB,
+  updated_at      DOUBLE PRECISION NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memory_items (
   memory_id       TEXT PRIMARY KEY,
   user_id         TEXT NOT NULL,
@@ -133,6 +145,13 @@ class TaskManager:
         )
         async with self.pool.acquire() as c:
             await c.execute(SCHEMA)
+            # Safe schema migrations for existing tables
+            await c.execute("""
+                ALTER TABLE tasks ADD COLUMN IF NOT EXISTS contract_json JSONB;
+                ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notification_pref TEXT DEFAULT 'text';
+                ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notified_at DOUBLE PRECISION;
+                ALTER TABLE tasks ADD COLUMN IF NOT EXISTS decision_category TEXT DEFAULT 'A';
+            """)
         log.info("TaskManager connected and schema applied")
 
     async def close(self) -> None:
@@ -180,22 +199,65 @@ class TaskManager:
                           budget_usd: Optional[float] = None,
                           deadline_ts: Optional[float] = None,
                           parent_task_id: Optional[str] = None,
-                          task_id: Optional[str] = None) -> str:
+                          task_id: Optional[str] = None,
+                          notification_pref: str = "text",
+                          contract: Optional[Dict[str, Any]] = None,
+                          decision_category: str = "A") -> str:
         tid = task_id or str(uuid.uuid4())
         now = time.time()
         assert self.pool is not None
+        contract_raw = json.dumps(contract) if contract else None
         async with self.pool.acquire() as c:
             await c.execute("""
                 INSERT INTO tasks(task_id, user_id, chat_id, description, domain,
                                   status, priority, entry_agent_id, budget_usd,
-                                  deadline_ts, parent_task_id, created_at, updated_at)
-                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
+                                  deadline_ts, parent_task_id, notification_pref,
+                                  contract_json, decision_category, created_at, updated_at)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
             """, tid, str(user_id), str(chat_id) if chat_id else None,
                 description, domain, TaskStatus.PENDING.value, priority,
-                entry_agent_id, budget_usd, deadline_ts, parent_task_id, now)
+                entry_agent_id, budget_usd, deadline_ts, parent_task_id,
+                notification_pref, contract_raw, decision_category, now)
         await self.log_event(tid, "task.created",
-                             {"user_id": str(user_id), "description": description[:300]})
+                             {"user_id": str(user_id), "description": description[:300],
+                              "notification_pref": notification_pref, "category": decision_category})
         return tid
+
+    async def mark_notified(self, task_id: str) -> None:
+        """Record timestamp that completion notification was successfully delivered."""
+        if self.pool is None:
+            return
+        async with self.pool.acquire() as c:
+            await c.execute("UPDATE tasks SET notified_at=$2, updated_at=$2 WHERE task_id=$1", task_id, time.time())
+
+    # ---------------- emergency stop ----------------
+
+    async def set_emergency_stop(self, enabled: bool, user_id: str, reason: str = "") -> None:
+        """Activate or release global emergency stop across all agents and services."""
+        if self.pool is None:
+            return
+        async with self.pool.acquire() as c:
+            await c.execute("""
+                INSERT INTO system_flags(flag_name, value_bool, details, updated_at)
+                VALUES('emergency_stop', $1, $2, $3)
+                ON CONFLICT (flag_name) DO UPDATE
+                  SET value_bool=EXCLUDED.value_bool, details=EXCLUDED.details, updated_at=EXCLUDED.updated_at
+            """, enabled, json.dumps({"user_id": user_id, "reason": reason}), time.time())
+            if enabled:
+                # Cancel or pause all active non-terminal tasks
+                await c.execute("""
+                    UPDATE tasks SET status='PAUSED', error='Emergency stop triggered by operator'
+                    WHERE status IN ('PENDING', 'QUEUED', 'RUNNING')
+                """)
+        await self.audit(user_id, "system.emergency_stop", {"enabled": enabled, "reason": reason})
+
+    async def is_emergency_stop_active(self) -> bool:
+        """Check if global emergency stop is engaged."""
+        if self.pool is None:
+            return False
+        async with self.pool.acquire() as c:
+            row = await c.fetchrow("SELECT value_bool FROM system_flags WHERE flag_name='emergency_stop'")
+        return bool(row["value_bool"]) if row else False
 
     async def set_status(self, task_id: str, status: TaskStatus,
                          current_step: Optional[str] = None,

@@ -545,20 +545,49 @@ async def _create_task_and_ack(message: Message, text: str):
     q: TaskQueue = STATE["queue"]
     user_id = message.from_user.id if message.from_user else 0
     chat_id = message.chat.id
-    tid = await tm.create_task(user_id=str(user_id), chat_id=str(chat_id),
-                               description=text, entry_agent_id="coordinator-1")
+
+    if await tm.is_emergency_stop_active():
+        await message.answer(
+            "🚨 *JARVIS Favqulodda To'xtatish (KILL SWITCH) Faol!*\n\n"
+            "Tizim operator tomonidan to'xtatilgan, yangi vazifalar qabul qilinmaydi.\n"
+            "Bekor qilish uchun `/resume_all` buyrug'ini bering.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Infer notification preference from natural language
+    lower = text.lower()
+    pref = "text"
+    if any(k in lower for k in ("call me when", "tugagach qo'ng'iroq", "tugasa telefon", "позвони когда", "сделай звонок когда")):
+        pref = "call"
+    elif any(k in lower for k in ("voice note", "ovozli xabar", "голосовое сообщение")):
+        pref = "voice"
+
+    tid = await tm.create_task(
+        user_id=str(user_id),
+        chat_id=str(chat_id),
+        description=text,
+        entry_agent_id="coordinator-1",
+        notification_pref=pref,
+    )
     await q.enqueue(tid)
     await tm.set_status(tid, TaskStatus.QUEUED)
-    await tm.audit(str(user_id), "task.created", {"task_id": tid})
+    await tm.audit(str(user_id), "task.created", {"task_id": tid, "notification_pref": pref})
     try:
-        cm=ConversationMemory(tm.pool); await cm.ensure()
-        await cm.append(user_id,chat_id,"user",text)
-    except Exception: pass
+        cm = ConversationMemory(tm.pool)
+        await cm.ensure()
+        await cm.append(user_id, chat_id, "user", text)
+    except Exception:
+        pass
     short = tid[:8]
+    pref_info = f"\n🔔 Xabarnoma: `{pref}`" if pref != "text" else ""
     sent = await message.answer(
-        "🤖 AgentOS\n\n"
+        f"🤖 *JARVIS Vazifalar Markazi*\n\n"
+        f"Topshiriq ID: `{short}`{pref_info}\n"
         "░░░░░░░░░░░░░░░░░░░░ 0%\n\n"
-        "⏳ Ishlayapman...")
+        "⏳ Ish bajarilmoqda, ser...",
+        parse_mode="Markdown"
+    )
     asyncio.create_task(_task_progress_loop(tid, chat_id, sent.message_id),
                         name="task-progress-" + short)
 
@@ -626,6 +655,147 @@ async def cmd_retry(message: Message, command: CommandObject):
 async def cmd_stop(message: Message, command: CommandObject):
     # /stop is an alias for /cancel
     await cmd_cancel(message, command)
+
+
+@router.message(Command("stop_all"))
+@router.message(Command("kill_switch"))
+async def cmd_stop_all(message: Message, command: CommandObject):
+    tm: TaskManager = STATE.get("tm")
+    if not tm:
+        await message.answer("⚠️ Tizim boshqaruvi mavjud emas.")
+        return
+    uid = _uid(message)
+    reason = (command.args or "").strip() or "Operator triggered emergency kill switch"
+    await tm.set_emergency_stop(True, user_id=uid, reason=reason)
+    await message.answer(
+        "🚨 *JARVIS Favqulodda To'xtatish (KILL SWITCH) Faollashtirildi!*\n\n"
+        "• Barcha faol va navbatdagi topshiriqlar to'xtatildi (`PAUSED`).\n"
+        "• Yangi topshiriqlar qabul qilinishi va tashqi resurslarga murojaatlar bloklandi.\n"
+        "• Tizimni qayta tiklash uchun: `/resume_all` buyrug'ini yuboring.",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(Command("resume_all"))
+async def cmd_resume_all(message: Message):
+    tm: TaskManager = STATE.get("tm")
+    if not tm:
+        await message.answer("⚠️ Tizim boshqaruvi mavjud emas.")
+        return
+    uid = _uid(message)
+    await tm.set_emergency_stop(False, user_id=uid, reason="Operator released emergency stop")
+    await message.answer(
+        "🟢 *Favqulodda to'xtatish holati bekor qilindi.*\n\n"
+        "Tizim va barcha agentlar odatiy avtonom ish rejimiga qaytdi, ser.",
+        parse_mode="Markdown"
+    )
+
+
+# ---------------- Telegram Voice Calling ----------------
+
+@router.message(Command("call"))
+async def cmd_call(message: Message, command: CommandObject):
+    from core.calling import get_calling_manager, CallTrigger
+    cm = get_calling_manager()
+    recip = message.from_user.id if message.from_user else message.chat.id
+    arg = (command.args or "").strip()
+
+    ok, msg = await cm.request_call(
+        recipient_id=recip,
+        trigger=CallTrigger.USER_COMMAND,
+        prompt_summary=arg or "User requested direct voice call",
+    )
+    if ok:
+        await message.answer(f"📞 *Qo'ng'iroq yo'naltirildi*\n\n{msg}", parse_mode="Markdown")
+    else:
+        status = cm.get_status()
+        diag = (
+            f"⚠️ *Ovozli qo'ng'iroq amalga oshirilmadi*\n\n"
+            f"*Sabab:* {msg}\n\n"
+            f"📊 *Infratuzilma holati:*\n"
+            f"• Holat kodi: `{status['state']}`\n"
+            f"• MTProto VoIP kutubxonasi: `{'✅ Mavjud' if status['mtproto_library_available'] else '❌ Mavjud emas'}`\n"
+            f"• Telegram User hisob ma'lumotlari: `{'✅ Sozlangan' if status['has_credentials'] else '❌ Sozlanmagan'}`\n\n"
+            f"💡 *Texnik haqiqat:* Standart Telegram Bot API bot orqali shaxsiy 1-to-1 telefon qo'ng'iroqlarini qo'llab-quvvatlamaydi. "
+            f"Bu xususiyat uchun maxsus MTProto foydalanuvchi sessiyasi (`TELEGRAM_CALLING_SESSION_STRING`) zarur. "
+            f"Batafsil ma'lumot: `/call_help`"
+        )
+        await message.answer(diag, parse_mode="Markdown")
+
+
+@router.message(Command("call_status"))
+async def cmd_call_status(message: Message):
+    from core.calling import get_calling_manager
+    cm = get_calling_manager()
+    s = cm.get_status()
+    text = (
+        f"📊 *JARVIS Ovozli Qo'ng'iroq Diagnostikasi*\n\n"
+        f"• Holat (State): `{s['state']}`\n"
+        f"• Yoqilganligi (Enabled): `{'Ha' if s['enabled'] else 'Yoq'}`\n"
+        f"• Hisob ma'lumotlari: `{'Mavjud' if s['has_credentials'] else 'Yetishmaydi'}`\n"
+        f"• MTProto kutubxonasi: `{'Mavjud' if s['mtproto_library_available'] else 'Mavjud emas'}`\n"
+        f"• Tungi sukunat (Quiet Hours): `{'Faol (qo\'ng\'iroq bloklanadi)' if s['in_quiet_hours'] else 'Noo\'rin (qo\'ng\'iroq ruxsat etilgan)'}`\n"
+        f"• Kuting (Cooldown): `{s['cooldown_remaining_sec']} soniya`\n"
+        f"• Ruxsat etilgan ID: `{s['authorized_user_id'] or 'Barchaga (Cheklanmagan)'}`\n\n"
+        f"🔍 *Kutubxona xabari:* {s['library_diagnostic']}\n\n"
+        f"Qo'ng'iroqni sinovdan o'tkazish uchun: `/call_test`"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+
+@router.message(Command("call_test"))
+async def cmd_call_test(message: Message):
+    from core.calling import get_calling_manager
+    cm = get_calling_manager()
+    recip = message.from_user.id if message.from_user else message.chat.id
+    res = cm.test_call(recip)
+    passed = res["test_passed"]
+    icon = "✅" if passed else "⚠️"
+    text = (
+        f"{icon} *Qo'ng'iroq Infratuzilmasi Test Natijasi*\n\n"
+        f"• Test natijasi: `{'Muvaffaqiyatli' if passed else 'To‘siq mavjud'}`\n"
+        f"• Sabab: {res['readiness_reason']}\n"
+        f"• Tavsiya: {res['recommendation']}"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+
+@router.message(Command("call_enable"))
+async def cmd_call_enable(message: Message):
+    from core.calling import get_calling_manager
+    cm = get_calling_manager()
+    recip = message.from_user.id if message.from_user else message.chat.id
+    ok, msg = cm.enable(recip)
+    await message.answer(msg, parse_mode="Markdown")
+
+
+@router.message(Command("call_disable"))
+async def cmd_call_disable(message: Message):
+    from core.calling import get_calling_manager
+    cm = get_calling_manager()
+    recip = message.from_user.id if message.from_user else message.chat.id
+    ok, msg = cm.disable(recip)
+    await message.answer(msg, parse_mode="Markdown")
+
+
+@router.message(Command("call_help"))
+async def cmd_call_help(message: Message):
+    text = (
+        "📖 *Telegram Ovozli Qo'ng'iroq Arxitekturasi va Yo'riqnoma*\n\n"
+        "1. *Cheklov:* Rasmiy Telegram Bot API 1-to-1 audio qo'ng'iroq qilish imkoniyatiga ega emas. Faqat guruh ovozli chatlari mavjud.\n\n"
+        "2. *Arxitektura:* JARVIS ning shaxsiy raqamingizga qo'ng'iroq qilishi uchun alohida MTProto foydalanuvchi sessiyasi (Pyrogram/Telethon) va VoIP audio protokoli kerak bo'ladi.\n\n"
+        "3. *Konfiguratsiya o'zgaruvchilari:*\n"
+        "• `TELEGRAM_CALLING_ENABLED=true`\n"
+        "• `TELEGRAM_CALLING_API_ID` (my.telegram.org dan)\n"
+        "• `TELEGRAM_CALLING_API_HASH`\n"
+        "• `TELEGRAM_CALLING_SESSION_STRING` (User session Pyrogram orqali)\n"
+        "• `TELEGRAM_CALLING_AUTHORIZED_USER_ID` (Sizning Telegram ID)\n\n"
+        "4. *Xavfsizlik va tartib:*\n"
+        "• Tungi sukunat (23:00 - 07:00 oralig'ida qo'ng'iroqlar avtomatik to'xtatiladi).\n"
+        "• Bezovta qilmaslik uchun 5 daqiqalik cooldown mavjud.\n"
+        "• Agar qo'ng'iroq ulanmasa, JARVIS avtomatik ravishda ovozli xabar (Voice Note) orqali hisobot qoldiradi."
+    )
+    await message.answer(text, parse_mode="Markdown")
 
 
 async def _update_task(message: Message, args: Optional[str], status: TaskStatus):
@@ -832,18 +1002,18 @@ _CHAT_HISTORY: dict = {}
 
 _IMAGE_GEN_RE = _re.compile(
     r"(?:^/image|^/draw|^/imagine|"
-    r"(?:\brasm\b|\bsurat\b|\btasvir\b|\bimage\b|\bpicture\b|\bphoto\b|\bкартинк|\bизображени|\bрисун)"
+    r"(?:\brasm\w*|\bsurat\w*|\btasvir\w*|\bimage\w*|\bpicture\w*|\bphoto\w*|\bкартинк\w*|\bизображени\w*|\bрисун\w*)"
     r".*?(?:\bchiz|\byarat|\bqilib\s+ber|\byasa|\bkerak|\bdraw|\bpaint|\bgenerate|\bcreate|\bmake|\bнарисуй|\bсоздай|\bсгенерируй)|"
     r"(?:\bchiz|\byarat|\bqilib\s+ber|\bdraw|\bpaint|\bgenerate|\bcreate|\bнарисуй|\bсоздай|\bсгенерируй)"
-    r".*?(?:\brasm\b|\bsurat\b|\btasvir\b|\bimage\b|\bpicture\b|\bphoto\b|\bкартинк|\bизображени|\bрисун))",
+    r".*?(?:\brasm\w*|\bsurat\w*|\btasvir\w*|\bimage\w*|\bpicture\w*|\bphoto\w*|\bкартинк\w*|\bизображени\w*|\bрисун\w*))",
     _re.I)
 
 _VIDEO_GEN_RE = _re.compile(
     r"(?:^/video|^/animate|"
-    r"(?:\bvideo\b|\brolik\b|\bklip\b|\bclip\b|\bвидео\b|\bролик\b)"
+    r"(?:\bvideo\w*|\brolik\w*|\bklip\w*|\bclip\w*|\bвидео\w*|\bролик\w*)"
     r".*?(?:\byarat|\btayyorla|\bqilib\s+ber|\byasa|\bkerak|\bcreate|\bgenerate|\bmake|\brender|\bсоздай|\bсделай|\bсгенерируй)|"
     r"(?:\byarat|\btayyorla|\bqilib\s+ber|\bcreate|\bgenerate|\bmake|\brender|\bсоздай|\bсделай|\bсгенерируй)"
-    r".*?(?:\bvideo\b|\brolik\b|\bklip\b|\bclip\b|\bвидео\b|\bролик\b))",
+    r".*?(?:\bvideo\w*|\brolik\w*|\bklip\w*|\bclip\w*|\bвидео\w*|\bролик\w*))",
     _re.I)
 
 _FULLSTACK_GEN_RE = _re.compile(
@@ -854,18 +1024,18 @@ _FULLSTACK_GEN_RE = _re.compile(
 
 _WEBSITE_GEN_RE = _re.compile(
     r"(?:^/web|^/website|^/site|"
-    r"(?:\bsayt\b|\bveb\s*sayt\b|\bwebsite\b|\bweb\s*page\b|\blanding\s+page\b|\bсайт\b|\bлендинг\b)"
+    r"(?:\bsayt\w*|\bveb\s*sayt\w*|\bwebsite\w*|\bweb\s*page\w*|\blanding\s+page\w*|\bсайт\w*|\bлендинг\w*)"
     r".*?(?:\byarat|\btuz|\byasab\s+ber|\bqilib\s+ber|\byasa|\bkerak|\bcreate|\bbuild|\bmake|\bdesign|\bgenerate|\bсоздай|\bсделай|\bнапиши)|"
     r"(?:\byarat|\btuz|\byasab\s+ber|\bqilib\s+ber|\bcreate|\bbuild|\bmake|\bdesign|\bgenerate|\bсоздай|\bсделай|\bнапиши)"
-    r".*?(?:\bsayt\b|\bveb\s*sayt\b|\bwebsite\b|\bweb\s*page\b|\blanding\s+page\b|\bсайт\b|\bлендинг\b))",
+    r".*?(?:\bsayt\w*|\bveb\s*sayt\w*|\bwebsite\w*|\bweb\s*page\w*|\blanding\s+page\w*|\bсайт\w*|\bлендинг\w*))",
     _re.I)
 
 _PRESENTATION_GEN_RE = _re.compile(
     r"(?:^/presentation|^/slides|^/ppt|"
-    r"(?:\btaqdimot\b|\bslayd\b|\bslaydlar\b|\bpresentation\b|\bslides\b|\bпрезентаци|\bслайд)"
+    r"(?:\btaqdimot\w*|\bslayd\w*|\bslaydlar\w*|\bpresentation\w*|\bslides\w*|\bпрезентаци\w*|\bслайд\w*)"
     r".*?(?:\byarat|\btayyorla|\bqilib\s+ber|\byasa|\bkerak|\bcreate|\bmake|\bgenerate|\bсоздай|\bсделай)|"
     r"(?:\byarat|\btayyorla|\bqilib\s+ber|\bcreate|\bmake|\bgenerate|\bсоздай|\bсделай)"
-    r".*?(?:\btaqdimot\b|\bslayd\b|\bslaydlar\b|\bpresentation\b|\bslides\b|\bпрезентаци|\bслайд))",
+    r".*?(?:\btaqdimot\w*|\bslayd\w*|\bslaydlar\w*|\bpresentation\w*|\bslides\w*|\bпрезентаци\w*|\bслайд\w*))",
     _re.I)
 
 _PLUGINS_RE = _re.compile(
@@ -874,6 +1044,16 @@ _PLUGINS_RE = _re.compile(
 
 _GITHUB_ACTION_RE = _re.compile(
     r"(?:^/github|\bgithub\s+(?:ga\s+yukla|repo|repository|da\s+och|ga\s+push))",
+    _re.I)
+
+_CALL_REQUEST_RE = _re.compile(
+    r"(?:^/call|\bcall\s+me\b|\bcall\s+my\s+phone\b|\bmenga\s+qo'ng'iroq\s+qil\b|\bmening\s+telefonimga\s+qo'ng'iroq\s+qil\b|"
+    r"\bmeni\s+chaqir\b|\bпозвони\s+мне\b|\bнабери\s+мне\b|\bсделай\s+звонок\b)",
+    _re.I)
+
+_EMERGENCY_STOP_RE = _re.compile(
+    r"(?:^/stop_all|^/kill_switch|\bemergency\s+stop\b|\bkill\s+switch\b|\bhamma\s+narsani\s+to'xtat\b|"
+    r"\bbarcha\s+vazifalarni\s+to'xtat\b|\bto'xtat\s+hammasini\b|\bостанови\s+всё\b|\bаварийная\s+остановка\b)",
     _re.I)
 
 
@@ -1075,6 +1255,16 @@ async def _chat_or_task(message: Message, text: str) -> None:
         await _create_task_and_ack(message, m.group(1).strip())
         return
 
+    # Emergency kill switch recognition
+    if _EMERGENCY_STOP_RE.search(text):
+        await cmd_stop_all(message, CommandObject(prefix="/", command="stop_all", args="Emergency stop via natural language command"))
+        return
+
+    # Direct Telegram voice calling recognition
+    if _CALL_REQUEST_RE.search(text):
+        await cmd_call(message, CommandObject(prefix="/", command="call", args=text))
+        return
+
     # Direct generative & integration capabilities (Seamless natural language)
     if _IMAGE_GEN_RE.search(text):
         await handle_image_generation(message, text)
@@ -1118,13 +1308,36 @@ def _get_current_persona(facts: list) -> str:
         f"📅 BUGUNGI REAL SANA VA VAQT: {curr_date}, {curr_time}. JORIY YIL: {year}-YIL.\n"
         f"Sen 2026-yilning eng ilg'or dunyosida yashaysan va real vaqtdagi internet ma'lumotlariga to'liq egasan. "
         f"Hech qachon 'mening bilimlarim 2023-yilgacha' yoki 'men faqat til modeliman' deb aytma!\n\n"
-        "👑 SENING JARVIS USLUBING VA FAZILATLARING:\n"
+        "👑 SENING JARVIS SHAXSIYATI VA FAZILATLARING:\n"
         "• Tony Starkning JARVIS AI uslubida gapir: sadoqatli, samimiy, dadil, o'tkir aql, yengil nozik hazil va to'liq tayyorlik ('Buyuring, ser', 'Albatta do'stim, hoziroq tayyorlayman').\n"
         "• Quruq rasmiyatchilikni, 'Sizga qanday yordam bera olaman?' kabi sun'iy robotcha iboralarni BUTUNLAY unut.\n"
         "• Polimat aql: texnologiya, dasturlash, biznes, startaplar, marketing, falsafa, psixologiya, dizayn (Figma/Canva) va muhandislikni birlashtir.\n"
         "• Lider va CEO tafakkuri: o'tkir, strategik, dadil, amaliy va natijaga yo'naltirilgan bo'l.\n"
         "• Foydalanuvchi qaysi tilda yozsa (o'zbek, rus, ingliz) o'sha tilda sof, tabiiy, zamonaviy va jonli so'zlash.\n"
-        "• Har qanday murakkab masalani eng yuqori saviyada, xatosiz, mukammal va professional darajada hal qilasan."
+        "• Har qanday murakkab masalani eng yuqori saviyada, xatosiz, mukammal va professional darajada hal qilasan.\n\n"
+        "⚖️ INTELLECTUAL HONESTY & ETHICAL PRINCIPLES (12 OLTIN QOIDA):\n"
+        "1. Foydalanuvchining ko'nglini olish uchungina uning xato fikriga asossiz qo'shilma.\n"
+        "2. Agar taxmin yoki faraz noto'g'ri bo'lsa, sababini aniq, asosli va dalillar bilan tushuntir.\n"
+        "3. Isbotlangan faktlar, mantiqiy xulosalar, gipotezalar va taxminlarni qat'iy farqlab ber.\n"
+        "4. Zaif mantiqiy zanjirlarni va mantiqiy xatoliklarni (fallacies) ochiq ko'rsatib ber.\n"
+        "5. Noaniqlik mavjud bo'lsa, uni yashirmasdan ochiq tushuntir.\n"
+        "6. Xatoliklarni e'tirozsiz tan ol va himoyalanishsiz darhol to'g'irla.\n"
+        "7. Hech qachon soxta manbalar, xayoliy tajribalar, soxta test natijalari yoki qilinmagan ishlarni to'qima.\n"
+        "8. Agar g'oya yaxshi lekin texnik jihatdan nomaqbul bo'lsa, to'siqlarni tushuntirib, ancha yaxshiroq muqobilini taklif qil.\n"
+        "9. Agar g'oya noo'rin bo'lsa, hurmat bilan sababini ko'rsat va kuchli muqobilini ber.\n"
+        "10. Bir nechta yo'l bo'lsa, trade-off (yutuq va yo'qotishlar)ni solishtirib, eng yaxshisini tavsiya et.\n"
+        "11. O'zingda yo'q insoniy his-tuyg'ular yoki ong bor deb da'vo qilma.\n"
+        "12. Hamma narsani biluvchi (omniscient) qiyofasiga kirmasdan, aniq faktlar doirasida tur.\n\n"
+        "🎭 MOSLASHUVCHAN REJIMLAR (9 ADAPTIVE MODES):\n"
+        "1. Ustoz va Murabbiy: murakkab tushunchalarni sabr bilan, Sokratik savollar va aniq misollar orqali o'rgat.\n"
+        "2. Tanqidiy Fikrlovchi: g'oyalarni stress-testdan o'tkaz, zaif joylarini ochib ber.\n"
+        "3. Tadqiqotchi Tahlilchi: faktlarni chuqur tekshir, manbalarni tahlil qil.\n"
+        "4. Avtonom Dasturchi: to'liq ishlab turuvchi, placeholder'siz, xatosiz va production-darajadagi kod yoz.\n"
+        "5. Loyiha Menejeri: vazifalarni bosqichlarga ajrat, muddat va natijalarni nazorat qil.\n"
+        "6. Ijodiy Hamkor: zamonaviy dizayn, premium estetika, kontent va video/rasm g'oyalarini taqdim et.\n"
+        "7. Texnik Maslahatchi: eng zamonaviy arxitektura va amaliyotlarni qo'lla.\n"
+        "8. Shaxsiy Yordamchi: tez, qat'iy va samarali yordam ko'rsat.\n"
+        "9. Strategik Maslahatchi (CEO Mindset): katta rasm, ROI, biznes o'sishi va kengayishga yo'naltir."
     )
     if facts:
         p += "\n\n🧠 Foydalanuvchi haqida doimiy xotirang:\n" + "\n".join(f"- {f}" for f in facts)

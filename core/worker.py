@@ -144,19 +144,6 @@ class Worker:
                     except Exception:
                         log.exception("Failed to release execution lock")
 
-    async def _run_task(self, task_id: str) -> None:
-        assert self.tm and self.orch
-        row = await self.tm.get_task(task_id)
-        if not row:
-            log.warning("Task %s not found in DB", task_id)
-            return
-        if row["status"] in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value):
-            return
-        if row["status"] == TaskStatus.PAUSED.value:
-            log.info("Task %s is paused; skipping", task_id)
-            return
-
-
     async def _monitor_task_progress(self, task_id: str) -> None:
         seen = 0
         step_ok = 0
@@ -190,22 +177,41 @@ class Worker:
             except Exception as exc:
                 log.debug("progress monitor: %s", exc)
             row = await self.tm.get_task(task_id)
-            if row and row.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
+            if row and row.get("status") in ("COMPLETED", "FAILED", "CANCELLED", "PAUSED"):
                 return
             await asyncio.sleep(1)
+
+    async def _run_task(self, task_id: str) -> None:
+        assert self.tm and self.orch
+        # Check global emergency stop
+        if await self.tm.is_emergency_stop_active():
+            log.warning("Task %s rejected: global emergency stop is active", task_id)
+            await self.tm.set_status(task_id, TaskStatus.PAUSED, error="Global emergency stop engaged")
+            return
+
+        row = await self.tm.get_task(task_id)
+        if not row:
+            log.warning("Task %s not found in DB", task_id)
+            return
+        if row["status"] in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value):
+            return
+        if row["status"] == TaskStatus.PAUSED.value:
+            log.info("Task %s is paused; skipping", task_id)
+            return
 
         await self.tm.set_status(task_id, TaskStatus.RUNNING, current_step="starting", progress=0.05)
         await self.tm.log_event(task_id, "worker.claimed", {"worker": self.name})
 
         original_description = row["description"]
-        description=row["description"]
+        description = row["description"]
         if self.conv and row.get("chat_id") and row.get("user_id"):
             try:
-                h=await self.conv.render(row["user_id"],row["chat_id"])
-                if h: description="Past conversation:\n"+h+"\n\nTask:\n"+description
-            except Exception: pass
-        task = Task(id=task_id, description=description,
-                    domain=row.get("domain") or "general")
+                h = await self.conv.render(row["user_id"], row["chat_id"])
+                if h:
+                    description = "Past conversation:\n" + h + "\n\nTask:\n" + description
+            except Exception:
+                pass
+        task = Task(id=task_id, description=description, domain=row.get("domain") or "general")
         entry_agent = row.get("entry_agent_id") or "coordinator-1"
 
         # Load latest checkpoint if any (for resume).
@@ -224,7 +230,7 @@ class Worker:
             artifacts = result.artifacts or []
             result_text = result.summary or ""
             if artifacts:
-                result_text += "\\n\\n__ARTIFACTS_JSON__\\n" + json.dumps(artifacts, ensure_ascii=False, default=str)
+                result_text += "\n\n__ARTIFACTS_JSON__\n" + json.dumps(artifacts, ensure_ascii=False, default=str)
             # Save result and status.
             if result.success:
                 explicit_artifacts = [
